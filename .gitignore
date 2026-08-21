@@ -1,0 +1,31 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local settings
+.env
+
+# Uploaded documents (keep the directory placeholder)
+documents/*
+!documents/.gitkeep
+*.pdf
+
+# FAISS/local storage (keep the directory placeholder)
+storage/*
+!storage/.gitkeep
+*.faiss
+*.pkl
+
+# Streamlit and tools
+.streamlit/
+.ruff_cache/
+.mypy_cache/
+
+# IDE and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
