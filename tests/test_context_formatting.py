@@ -4,7 +4,7 @@ from langchain_core.documents import Document
 
 from src.rag.config import Settings
 from src.rag.prompt import INSUFFICIENT_INFORMATION_MESSAGE
-from src.rag.rag_service import RagService, format_context
+from src.rag.rag_service import RagProgressEvent, RagService, format_context
 
 
 class EmptyVectorStore:
@@ -40,3 +40,12 @@ def test_no_results_returns_fixed_insufficient_information_message() -> None:
     assert result.answer == INSUFFICIENT_INFORMATION_MESSAGE
     assert result.sources == []
     assert result.chunks == []
+
+
+def test_answer_reports_progress_events_when_no_results() -> None:
+    service = RagService(EmptyVectorStore(), Settings(), chat_model=FailingChatModel())
+    events: list[RagProgressEvent] = []
+
+    service.answer("文件有說明採購哪個產品嗎？", progress_callback=events.append)
+
+    assert [event.stage for event in events] == ["received", "retrieve", "no_results"]

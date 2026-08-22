@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from langchain_core.documents import Document
 from langchain_ollama import ChatOllama
@@ -26,6 +26,16 @@ class RagResult:
     answer: str
     sources: list[SourceReference]
     chunks: list[Document]
+
+
+@dataclass(frozen=True, slots=True)
+class RagProgressEvent:
+    stage: str
+    message: str
+    detail: str = ""
+
+
+ProgressCallback = Callable[[RagProgressEvent], None]
 
 
 def _source_details(document: Document, number: int) -> SourceReference:
@@ -63,6 +73,16 @@ def _message_text(response: Any) -> str:
     return str(content).strip()
 
 
+def _emit_progress(
+    progress_callback: ProgressCallback | None,
+    stage: str,
+    message: str,
+    detail: str = "",
+) -> None:
+    if progress_callback is not None:
+        progress_callback(RagProgressEvent(stage, message, detail))
+
+
 class RagService:
     def __init__(
         self,
@@ -78,16 +98,57 @@ class RagService:
             temperature=0,
         )
 
-    def answer(self, question: str) -> RagResult:
+    def answer(
+        self,
+        question: str,
+        progress_callback: ProgressCallback | None = None,
+    ) -> RagResult:
         clean_question = question.strip()
         if not clean_question:
             raise ValueError("請先輸入問題。")
 
+        _emit_progress(progress_callback, "received", "已收到問題。", clean_question)
+        _emit_progress(
+            progress_callback,
+            "retrieve",
+            f"正在檢索最相關的 {self.settings.top_k} 個文字區塊。",
+        )
         chunks = similarity_search(self.vector_store, clean_question, self.settings.top_k)
         if not chunks:
+            _emit_progress(
+                progress_callback,
+                "no_results",
+                "沒有檢索到可用文字區塊。",
+            )
             return RagResult(INSUFFICIENT_INFORMATION_MESSAGE, [], [])
 
+        retrieved_sources = [
+            _source_details(chunk, number)
+            for number, chunk in enumerate(chunks, start=1)
+        ]
+        retrieved_detail = "\n".join(
+            f"[來源 {source.number}] {source.filename}，第 {source.page_number} 頁"
+            for source in retrieved_sources
+        )
+        _emit_progress(
+            progress_callback,
+            "retrieved",
+            f"已找到 {len(chunks)} 個相關文字區塊。",
+            retrieved_detail,
+        )
+
         context, sources = format_context(chunks)
+        _emit_progress(
+            progress_callback,
+            "context",
+            "正在組合帶來源編號的 Context。",
+            f"Context 長度約 {len(context):,} 個字元。",
+        )
+        _emit_progress(
+            progress_callback,
+            "generate",
+            f"正在呼叫 {self.settings.chat_model} 產生回答。",
+        )
         response = self.chat_model.invoke(
             [
                 ("system", SYSTEM_PROMPT),
@@ -95,4 +156,5 @@ class RagService:
             ]
         )
         answer = _message_text(response) or INSUFFICIENT_INFORMATION_MESSAGE
+        _emit_progress(progress_callback, "complete", "回答產生完成。")
         return RagResult(answer, sources, chunks)

@@ -15,7 +15,7 @@ from src.rag.document_loader import (
     SOURCE_FILENAME_KEY,
     process_uploaded_pdfs,
 )
-from src.rag.rag_service import RagResult, RagService
+from src.rag.rag_service import RagProgressEvent, RagResult, RagService
 from src.rag.vector_store import create_vector_store
 
 
@@ -242,6 +242,17 @@ def render_result(result: RagResult) -> None:
             st.text(chunk.page_content.strip())
 
 
+def render_progress_event(event: RagProgressEvent) -> None:
+    st.markdown(f"- **{event.message}**")
+    if event.detail:
+        st.code(event.detail, language=None)
+
+
+def render_progress_events(events: Sequence[RagProgressEvent]) -> None:
+    for event in events:
+        render_progress_event(event)
+
+
 def main() -> None:
     st.set_page_config(page_title="本機 PDF RAG 問答助手", page_icon="📚", layout="wide")
     st.title("本機 PDF RAG 問答助手")
@@ -283,6 +294,7 @@ def main() -> None:
                 ):
                     st.session_state.pop(preview_key, None)
                 st.session_state.pop("rag_result", None)
+                st.session_state.pop("rag_progress_events", None)
                 st.success("知識庫建立完成。")
             except PDFProcessingError as exc:
                 st.error(str(exc))
@@ -300,29 +312,64 @@ def main() -> None:
     question_tab, chunks_tab = st.tabs(["文件問答", "Chunk 預覽"])
 
     with question_tab:
-        st.subheader("文件問答")
-        question = st.text_area(
-            "輸入問題",
-            placeholder="例如：使用生成式 AI 時應注意哪些事項？",
-        )
-        if st.button("送出問題", type="primary"):
+        question_column, progress_column = st.columns([2.15, 1], gap="large")
+
+        with question_column:
+            st.subheader("文件問答")
+            question = st.text_area(
+                "輸入問題",
+                placeholder="例如：使用生成式 AI 時應注意哪些事項？",
+            )
+            submit_question = st.button("送出問題", type="primary")
+
+        with progress_column:
+            st.subheader("即時流程")
+            progress_placeholder = st.empty()
+
+        if submit_question:
             if not question.strip():
-                st.warning("沒有輸入問題，請先輸入想查詢的內容。")
+                with question_column:
+                    st.warning("沒有輸入問題，請先輸入想查詢的內容。")
             elif "vector_store" not in st.session_state:
-                st.warning("尚未建立知識庫，請先上傳 PDF 並按下「建立知識庫」。")
+                with question_column:
+                    st.warning("尚未建立知識庫，請先上傳 PDF 並按下「建立知識庫」。")
             else:
+                progress_events: list[RagProgressEvent] = []
                 try:
-                    with st.spinner("正在檢索文件並產生回答……"):
+                    with progress_placeholder.status(
+                        "正在處理問題……", expanded=True
+                    ) as status:
                         service = RagService(
                             st.session_state["vector_store"], settings
                         )
-                        st.session_state["rag_result"] = service.answer(question)
+
+                        def on_progress(event: RagProgressEvent) -> None:
+                            progress_events.append(event)
+                            render_progress_event(event)
+
+                        st.session_state["rag_result"] = service.answer(
+                            question,
+                            progress_callback=on_progress,
+                        )
+                        st.session_state["rag_progress_events"] = progress_events
+                        status.update(label="回答完成", state="complete", expanded=True)
                 except Exception as exc:
-                    st.error(friendly_error(exc))
+                    st.session_state["rag_progress_events"] = progress_events
+                    with question_column:
+                        st.error(friendly_error(exc))
+
+        with progress_column:
+            if not submit_question:
+                previous_events = st.session_state.get("rag_progress_events", [])
+                if previous_events:
+                    render_progress_events(previous_events)
+                else:
+                    st.caption("送出問題後，這裡會顯示檢索與回答產生流程。")
 
         result = st.session_state.get("rag_result")
         if result:
-            render_result(result)
+            with question_column:
+                render_result(result)
 
     with chunks_tab:
         chunks = st.session_state.get("knowledge_chunks")
