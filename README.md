@@ -4,7 +4,39 @@
 
 > 本專案僅供學習與資訊整理，不構成法律或合規建議。請勿上傳機密、個人資料或其他不應交由本機模型處理的內容。
 
+## 使用技術
+
+- Python：主要開發語言。
+- Streamlit：建立本機 Web 操作介面，提供 PDF 上傳、知識庫建立、文件問答與 Chunk 預覽。
+- LangChain：整合 RAG 流程中的文件載入、文字切分、Embedding、向量庫與聊天模型呼叫。
+- PyPDFLoader：解析 PDF，將 PDF 頁面轉成 LangChain `Document`。
+- RecursiveCharacterTextSplitter：將長文本依段落、換行與中文標點切成適合檢索的 Chunks。
+- Ollama：在本機執行 Embedding 模型與聊天模型。
+- bge-m3：Embedding 模型，負責將文字 Chunk 轉成語意向量。
+- qwen3:4b：聊天模型，負責根據檢索到的文件內容產生繁體中文回答。
+- FAISS：向量資料庫，用於儲存文字向量並執行相似度搜尋。
+- python-dotenv：讀取 `.env` 設定檔。
+- pytest：撰寫與執行單元測試。
+
 ## RAG 流程
+
+```text
+PDF 上傳
+  ↓
+PyPDFLoader 解析文字
+  ↓
+RecursiveCharacterTextSplitter 切分 Chunk
+  ↓
+bge-m3 產生 Embedding
+  ↓
+FAISS 建立向量索引
+  ↓
+使用者提問
+  ↓
+FAISS 取回相關 Chunk
+  ↓
+qwen3:4b 根據 Context 產生回答
+```
 
 1. 使用 `PyPDFLoader` 解析上傳的 PDF。
 2. 保留原始檔名，並將頁碼轉成一基頁碼顯示，再依中文標點切分文字。
@@ -36,6 +68,16 @@ local-pdf-rag-assistant/
 └── README.md
 ```
 
+主要檔案職責：
+
+- `app.py`：Streamlit 入口，負責畫面呈現、上傳流程、知識庫建立、問答操作與結果顯示。
+- `src/rag/config.py`：讀取 `.env` 與環境變數，集中管理 Ollama、模型、Chunk 與檢索參數。
+- `src/rag/document_loader.py`：處理 PDF 上傳內容、解析頁面文字、整理來源檔名與頁碼，並切分 Chunks。
+- `src/rag/vector_store.py`：建立 Ollama Embedding client，將 Chunks 寫入 FAISS，並提供相似度搜尋。
+- `src/rag/prompt.py`：集中管理系統提示詞與使用者提示詞格式，限制模型只能根據文件內容回答。
+- `src/rag/rag_service.py`：協調檢索、Context 格式化、呼叫聊天模型與回傳回答來源。
+- `tests/`：放置單元測試，涵蓋文件處理、Context 格式化與 Chunk 預覽分頁等邏輯。
+
 ## Windows 安裝與啟動
 
 需要 Python 3.11 與已安裝的 [Ollama](https://ollama.com/)。以下指令請在專案根目錄的 PowerShell 執行。如果系統可使用 `py` 而沒有 `python`，請將下列指令中的 `python` 改成 `py -3.11`。
@@ -65,6 +107,24 @@ pip install -r requirements.txt
 ```powershell
 Copy-Item .env.example .env
 ```
+
+可調整的環境參數：
+
+```env
+OLLAMA_BASE_URL=http://localhost:11434
+EMBEDDING_MODEL=bge-m3
+CHAT_MODEL=qwen3:4b
+CHUNK_SIZE=500
+CHUNK_OVERLAP=80
+TOP_K=4
+```
+
+- `OLLAMA_BASE_URL`：Ollama 服務網址，預設為本機服務。
+- `EMBEDDING_MODEL`：Embedding 模型名稱，用於將文字轉成語意向量。
+- `CHAT_MODEL`：聊天模型名稱，用於根據檢索到的 Context 產生回答。
+- `CHUNK_SIZE`：每個 Chunk 的目標字元數。
+- `CHUNK_OVERLAP`：相鄰 Chunk 的重疊字元數，用於保留上下文連續性。
+- `TOP_K`：問答時取回最相關的 Chunk 數量。
 
 下載本機模型（本專案不會自動下載）：
 
