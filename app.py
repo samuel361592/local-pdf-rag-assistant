@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+import logging
+from dataclasses import dataclass, field, replace
 from math import ceil
 from queue import Empty, Queue
 from threading import Event, Thread
@@ -14,9 +16,12 @@ from langchain_core.documents import Document
 
 from src.rag.config import Settings, load_settings
 from src.rag.document_loader import (
+    OCR_CONFIDENCE_KEY,
+    OCR_EXTRACTION_METHOD,
     PAGE_NUMBER_KEY,
     PDFProcessingError,
     SOURCE_FILENAME_KEY,
+    TEXT_EXTRACTION_METHOD_KEY,
     process_uploaded_pdfs,
 )
 from src.rag.rag_service import (
@@ -29,6 +34,13 @@ from src.rag.vector_store import create_vector_store
 
 
 ACTIVE_JOB_STATUSES = frozenset({"running", "cancelling"})
+LOGGER = logging.getLogger(__name__)
+OCR_MODE_LABELS = {
+    "auto": "自動",
+    "force": "強制",
+    "disabled": "停用",
+}
+OCR_MODE_VALUES = {label: value for value, label in OCR_MODE_LABELS.items()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +88,7 @@ def _run_rag_job(
     except RagAnswerCancelled as exc:
         job.updates.put(RagJobUpdate("cancelled", exc.partial_result))
     except Exception as exc:
+        LOGGER.exception("RAG answer job failed.")
         job.updates.put(RagJobUpdate("failed", exc))
 
 
@@ -127,11 +140,17 @@ def drain_rag_job_updates(job: RagAnswerJob) -> bool:
 def friendly_error(error: Exception) -> str:
     message = str(error)
     lowered = message.lower()
+    if isinstance(error, PDFProcessingError):
+        return message
+    if "paddleocr" in lowered or "paddlepaddle" in lowered:
+        return "需要 OCR 時找不到 PaddleOCR 或 PaddlePaddle。請先安裝 OCR 相依套件。"
+    if "ocr" in lowered:
+        return "OCR 辨識失敗。請確認 OCR 模型已下載完成，或改用較清晰的圖片/PDF 後再試。"
     if "connection" in lowered or "connect" in lowered or "refused" in lowered:
         return "無法連線到 Ollama。請確認 Ollama 已啟動，且 OLLAMA_BASE_URL 設定正確。"
     if "not found" in lowered or "pull model" in lowered or "404" in lowered:
         return "找不到指定的 Ollama 模型。請先下載 bge-m3 與 qwen3:4b。"
-    return message or "處理時發生未預期錯誤，請檢查 PDF 與 Ollama 設定。"
+    return "處理時發生未預期錯誤，請檢查檔案、OCR 與 Ollama 設定。"
 
 
 def get_page_window(
@@ -200,6 +219,11 @@ def shorten_filename(filename: object, max_length: int = 44) -> str:
     tail_length = min(12, max_length // 3)
     head_length = max_length - tail_length - 1
     return f"{text[:head_length]}…{text[-tail_length:]}"
+
+
+def ocr_preview_text_key(source: str) -> str:
+    digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
+    return f"ocr_preview_text_{digest}"
 
 
 def render_chunk_preview(chunks: Sequence[Document]) -> None:
@@ -319,15 +343,68 @@ def render_chunk_preview(chunks: Sequence[Document]) -> None:
     for original_index, chunk in filtered_chunks[start:end]:
         filename = chunk.metadata.get(SOURCE_FILENAME_KEY, "未知檔案")
         page_number = chunk.metadata.get(PAGE_NUMBER_KEY, "未知")
+        method = chunk.metadata.get(TEXT_EXTRACTION_METHOD_KEY, "unknown")
+        method_label = "OCR" if method == OCR_EXTRACTION_METHOD else "文字擷取"
         content = chunk.page_content.strip()
         short_filename = shorten_filename(filename)
         title = (
             f"Chunk #{original_index}　·　第 {page_number} 頁　·　"
-            f"{len(content):,} 字　·　{short_filename}"
+            f"{method_label}　·　{len(content):,} 字　·　{short_filename}"
         )
         with st.expander(title):
             st.caption(f"來源檔案：{filename}")
+            confidence = chunk.metadata.get(OCR_CONFIDENCE_KEY)
+            if confidence is not None:
+                st.caption(f"OCR 信心分數：{float(confidence):.2%}")
             st.write(content)
+
+
+def render_ocr_preview(ocr_text_by_source: dict[str, str]) -> None:
+    st.subheader("OCR 辨識結果")
+    if not ocr_text_by_source:
+        st.info("目前沒有 OCR 辨識文字。")
+        return
+
+    sources = sorted(ocr_text_by_source)
+    if st.session_state.get("ocr_preview_source") not in sources:
+        st.session_state["ocr_preview_source"] = sources[0]
+    selected_source = st.selectbox(
+        "OCR 來源",
+        options=sources,
+        key="ocr_preview_source",
+    )
+    text = ocr_text_by_source.get(selected_source, "").strip()
+    if not text:
+        st.warning("這個來源沒有辨識出文字。")
+        return
+    st.caption(f"{selected_source}｜{len(text):,} 字")
+    st.text_area(
+        "辨識文字",
+        value=text,
+        height=420,
+        disabled=True,
+        key=ocr_preview_text_key(selected_source),
+    )
+
+
+def render_ocr_controls(settings: Settings) -> Settings:
+    st.subheader("OCR")
+    mode_label = OCR_MODE_LABELS.get(settings.ocr_mode, "自動")
+    mode = st.selectbox(
+        "OCR 模式",
+        options=("自動", "強制", "停用"),
+        index=("自動", "強制", "停用").index(mode_label),
+        help="自動模式只會 OCR 空白或文字過少的 PDF 頁面；圖片檔一定需要 OCR。",
+    )
+    enable_images = st.checkbox(
+        "支援 PNG/JPG 圖片",
+        value=settings.ocr_enable_images,
+    )
+    return replace(
+        settings,
+        ocr_mode=OCR_MODE_VALUES[mode],
+        ocr_enable_images=enable_images,
+    )
 
 
 def render_result(result: RagResult) -> None:
@@ -457,10 +534,11 @@ def main() -> None:
     except ValueError as exc:
         st.error(f"設定錯誤：{exc}")
         st.stop()
+    settings = render_ocr_controls(settings)
 
     uploaded_files = st.file_uploader(
-        "上傳一份或多份 PDF",
-        type=["pdf"],
+        "上傳一份或多份 PDF / PNG / JPG",
+        type=["pdf", "png", "jpg", "jpeg"],
         accept_multiple_files=True,
     )
 
@@ -482,13 +560,21 @@ def main() -> None:
                     "documents": batch.document_count,
                     "pages": batch.page_count,
                     "chunks": len(batch.chunks),
+                    "native_pages": batch.extraction_stats.native_page_count,
+                    "ocr_pages": batch.extraction_stats.ocr_page_count,
+                    "image_pages": batch.extraction_stats.image_page_count,
+                    "average_ocr_confidence": (
+                        batch.extraction_stats.average_ocr_confidence
+                    ),
                 }
                 st.session_state["knowledge_chunks"] = batch.chunks
+                st.session_state["ocr_text_by_source"] = batch.ocr_text_by_source
                 st.session_state["chunk_preview_page"] = 1
                 for preview_key in (
                     "chunk_preview_filename",
                     "chunk_preview_page_filter",
                     "chunk_preview_search",
+                    "ocr_preview_source",
                 ):
                     st.session_state.pop(preview_key, None)
                 st.session_state.pop("rag_result", None)
@@ -496,19 +582,27 @@ def main() -> None:
                 st.session_state.pop("rag_job", None)
                 st.success("知識庫建立完成。")
             except PDFProcessingError as exc:
-                st.error(str(exc))
+                LOGGER.warning("Knowledge base creation failed.", exc_info=True)
+                st.error(friendly_error(exc))
             except Exception as exc:
+                LOGGER.exception("Knowledge base creation failed unexpectedly.")
                 st.error(friendly_error(exc))
 
     stats = st.session_state.get("knowledge_stats")
     if stats:
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("文件數量", stats["documents"])
         col2.metric("頁數", stats["pages"])
         col3.metric("Chunk 數量", stats["chunks"])
+        col4.metric("文字擷取頁", stats["native_pages"])
+        col5.metric("OCR 頁", stats["ocr_pages"])
+        if stats.get("average_ocr_confidence") is not None:
+            st.caption(f"OCR 平均信心分數：{stats['average_ocr_confidence']:.2%}")
 
     st.divider()
-    question_tab, chunks_tab = st.tabs(["文件問答", "Chunk 預覽"])
+    question_tab, chunks_tab, ocr_tab = st.tabs(
+        ["文件問答", "Chunk 預覽", "OCR 預覽"]
+    )
 
     with question_tab:
         question_job: RagAnswerJob | None = st.session_state.get("rag_job")
@@ -521,11 +615,22 @@ def main() -> None:
         question_fragment()
 
     with chunks_tab:
-        chunks = st.session_state.get("knowledge_chunks")
-        if chunks:
-            render_chunk_preview(chunks)
-        else:
-            st.info("建立知識庫後，可在這裡篩選並預覽切塊結果。")
+        @st.fragment
+        def chunk_preview_fragment() -> None:
+            chunks = st.session_state.get("knowledge_chunks")
+            if chunks:
+                render_chunk_preview(chunks)
+            else:
+                st.info("建立知識庫後，可在這裡篩選並預覽切塊結果。")
+
+        chunk_preview_fragment()
+
+    with ocr_tab:
+        @st.fragment
+        def ocr_preview_fragment() -> None:
+            render_ocr_preview(st.session_state.get("ocr_text_by_source", {}))
+
+        ocr_preview_fragment()
 
 
 if __name__ == "__main__":

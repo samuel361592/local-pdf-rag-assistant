@@ -3,7 +3,13 @@ from __future__ import annotations
 import pytest
 from langchain_core.documents import Document
 
-from app import filter_chunks, get_page_window, shorten_filename
+from app import (
+    filter_chunks,
+    friendly_error,
+    get_page_window,
+    ocr_preview_text_key,
+    shorten_filename,
+)
 from src.rag.document_loader import PAGE_NUMBER_KEY, SOURCE_FILENAME_KEY
 
 
@@ -93,3 +99,15 @@ def test_shorten_filename_preserves_both_ends() -> None:
 
 def test_shorten_filename_keeps_short_names_unchanged() -> None:
     assert shorten_filename("report.pdf") == "report.pdf"
+
+
+def test_friendly_error_hides_unknown_internal_details() -> None:
+    message = friendly_error(RuntimeError("internal stack detail at engine.cc:118"))
+
+    assert "internal stack detail" not in message
+    assert "engine.cc" not in message
+    assert "未預期錯誤" in message
+
+
+def test_ocr_preview_text_key_changes_with_source() -> None:
+    assert ocr_preview_text_key("page-1.png") != ocr_preview_text_key("page-2.png")

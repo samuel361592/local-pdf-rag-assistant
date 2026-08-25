@@ -10,6 +10,8 @@
 - Streamlit：建立本機 Web 操作介面，提供 PDF 上傳、知識庫建立、文件問答與 Chunk 預覽。
 - LangChain：整合 RAG 流程中的文件載入、文字切分、Embedding、向量庫與聊天模型呼叫。
 - PyPDFLoader：解析 PDF，將 PDF 頁面轉成 LangChain `Document`。
+- PyMuPDF：將需要 OCR 的 PDF 頁面轉成圖片。
+- PaddleOCR：辨識掃描型 PDF 頁面與 PNG/JPG 圖片中的中文、英文及數字。
 - RecursiveCharacterTextSplitter：將長文本依段落、換行與中文標點切成適合檢索的 Chunks。
 - Ollama：在本機執行 Embedding 模型與聊天模型。
 - bge-m3：Embedding 模型，負責將文字 Chunk 轉成語意向量。
@@ -21,9 +23,9 @@
 ## RAG 流程
 
 ```text
-PDF 上傳
+PDF / PNG / JPG 上傳
   ↓
-PyPDFLoader 解析文字
+PyPDFLoader 解析 PDF 文字；必要時用 PaddleOCR 補掃描頁或圖片文字
   ↓
 RecursiveCharacterTextSplitter 切分 Chunk
   ↓
@@ -38,8 +40,8 @@ FAISS 取回相關 Chunk
 qwen3:4b 根據 Context 產生回答
 ```
 
-1. 使用 `PyPDFLoader` 解析上傳的 PDF。
-2. 保留原始檔名，並將頁碼轉成一基頁碼顯示，再依中文標點切分文字。
+1. 使用 `PyPDFLoader` 解析上傳的 PDF；圖片檔或文字過少的 PDF 頁面會交給 OCR。
+2. 保留原始檔名、頁碼與解析方式，再依中文標點切分文字。
 3. 透過 Ollama 的 `bge-m3` 產生 Embedding。
 4. 將向量存入本次 Streamlit Session State 內的 FAISS 索引。
 5. 問答時取回最相關的 Chunk，組成帶來源編號的 Context。
@@ -67,9 +69,7 @@ local-pdf-rag-assistant/
 │   └── rag_service.py
 ├── tests/
 ├── documents/
-│   └── evaluation/
-│       ├── NIST.AI.100-1.pdf
-│       └── NIST.AI.600-1.pdf
+│   └── .gitkeep
 ├── storage/
 ├── .env.example
 ├── .gitignore
@@ -81,7 +81,8 @@ local-pdf-rag-assistant/
 
 - `app.py`：Streamlit 入口，負責畫面呈現、上傳流程、知識庫建立、問答操作與結果顯示。
 - `src/rag/config.py`：讀取 `.env` 與環境變數，集中管理 Ollama、模型、Chunk 與檢索參數。
-- `src/rag/document_loader.py`：處理 PDF 上傳內容、解析頁面文字、整理來源檔名與頁碼，並切分 Chunks。
+- `src/rag/document_loader.py`：處理 PDF/圖片上傳內容、決定一般解析或 OCR、整理來源檔名與頁碼，並切分 Chunks。
+- `src/rag/ocr_service.py`：使用 PyMuPDF 將 PDF 頁面轉成圖片，並用 PaddleOCR 辨識文字。
 - `src/rag/evaluation.py`：驗證 Golden Dataset、判定 Retrieval Hit，並計算 Hit Rate@1、@3、@5、@8 與 MRR。
 - `src/rag/vector_store.py`：建立 Ollama Embedding client，將 Chunks 寫入 FAISS，並提供相似度搜尋。
 - `src/rag/prompt.py`：集中管理系統提示詞與使用者提示詞格式，限制模型只能根據文件內容回答。
@@ -127,6 +128,11 @@ CHAT_MODEL=qwen3:4b
 CHUNK_SIZE=500
 CHUNK_OVERLAP=80
 TOP_K=4
+OCR_MODE=auto
+OCR_LANG=ch
+OCR_MIN_TEXT_CHARS=30
+OCR_DPI=300
+OCR_ENABLE_IMAGES=true
 ```
 
 - `OLLAMA_BASE_URL`：Ollama 服務網址，預設為本機服務。
@@ -135,6 +141,17 @@ TOP_K=4
 - `CHUNK_SIZE`：每個 Chunk 的目標字元數。
 - `CHUNK_OVERLAP`：相鄰 Chunk 的重疊字元數，用於保留上下文連續性。
 - `TOP_K`：問答時取回最相關的 Chunk 數量。
+- `OCR_MODE`：OCR 模式，可為 `auto`、`force` 或 `disabled`。自動模式只會 OCR 文字過少的 PDF 頁面。
+- `OCR_LANG`：PaddleOCR 語言，預設 `ch`。
+- `OCR_MIN_TEXT_CHARS`：自動模式下，單頁文字低於此字元數才執行 OCR。
+- `OCR_DPI`：PDF 頁面轉圖片時使用的解析度。
+- `OCR_ENABLE_IMAGES`：是否允許直接上傳 PNG/JPG 圖片做 OCR。
+
+若要使用 OCR，除 `requirements.txt` 之外，還需要依照本機 CPU/GPU 環境安裝 PaddlePaddle runtime。CPU 版可參考 PaddleOCR 官方安裝文件：
+
+```powershell
+python -m pip install paddlepaddle
+```
 
 下載本機模型（本專案不會自動下載）：
 
@@ -224,6 +241,6 @@ Evaluation 專用 FAISS 快取位於 `storage/retrieval_evaluation/<cache-key>/`
 
 - 無法連線：確認 Ollama 應用程式已啟動，預設服務網址是 `http://localhost:11434`。
 - 找不到模型：重新執行上述兩個 `ollama pull` 指令。
-- PDF 沒有文字：掃描型 PDF 通常需要先用其他工具進行 OCR，本專案第一版不含 OCR。
+- PDF 沒有文字：確認 `OCR_MODE` 不是 `disabled`，且已安裝 PaddleOCR 與 PaddlePaddle。
 - PDF 解壓縮錯誤：若看到 `Error -3 while decompressing data: invalid code lengths set`，通常代表 PDF 內部壓縮資料不標準或部分損毀。可先確認是否仍能建立知識庫；若無法解析，請用瀏覽器或 PDF 閱讀器開啟後「列印成 PDF」重新輸出一份再上傳。
 - 回答不正確：展開「實際檢索到的原始文字區塊」，先確認檢索結果是否包含答案，再調整 Chunk 或問題用詞。
