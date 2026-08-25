@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Event
 from typing import Any, Callable, Sequence
 
 from langchain_core.documents import Document
@@ -36,6 +37,15 @@ class RagProgressEvent:
 
 
 ProgressCallback = Callable[[RagProgressEvent], None]
+TokenCallback = Callable[[str], None]
+
+
+class RagAnswerCancelled(Exception):
+    """使用者取消回答，並保留取消前已產生的內容。"""
+
+    def __init__(self, partial_result: RagResult) -> None:
+        super().__init__("回答已由使用者停止。")
+        self.partial_result = partial_result
 
 
 def _source_details(document: Document, number: int) -> SourceReference:
@@ -71,6 +81,20 @@ def _message_text(response: Any) -> str:
         parts = [item.get("text", "") if isinstance(item, dict) else str(item) for item in content]
         return "".join(parts).strip()
     return str(content).strip()
+
+
+def _chunk_text(response: Any) -> str:
+    """取出串流片段文字，保留片段前後空白以免拼接後文字黏在一起。"""
+
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            item.get("text", "") if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    return str(content)
 
 
 def _emit_progress(
@@ -156,5 +180,103 @@ class RagService:
             ]
         )
         answer = _message_text(response) or INSUFFICIENT_INFORMATION_MESSAGE
+        _emit_progress(progress_callback, "complete", "回答產生完成。")
+        return RagResult(answer, sources, chunks)
+
+    def answer_stream(
+        self,
+        question: str,
+        *,
+        cancel_event: Event,
+        progress_callback: ProgressCallback | None = None,
+        token_callback: TokenCallback | None = None,
+    ) -> RagResult:
+        """以串流方式回答問題，並在安全檢查點回應取消要求。"""
+
+        clean_question = question.strip()
+        if not clean_question:
+            raise ValueError("請先輸入問題。")
+
+        chunks: list[Document] = []
+        sources: list[SourceReference] = []
+        answer_parts: list[str] = []
+
+        def raise_if_cancelled() -> None:
+            if not cancel_event.is_set():
+                return
+            partial_answer = "".join(answer_parts).strip()
+            _emit_progress(progress_callback, "cancelled", "回答已由使用者停止。")
+            raise RagAnswerCancelled(
+                RagResult(partial_answer, list(sources), list(chunks))
+            )
+
+        raise_if_cancelled()
+        _emit_progress(progress_callback, "received", "已收到問題。", clean_question)
+        _emit_progress(
+            progress_callback,
+            "retrieve",
+            f"正在檢索最相關的 {self.settings.top_k} 個文字區塊。",
+        )
+        chunks = similarity_search(self.vector_store, clean_question, self.settings.top_k)
+        raise_if_cancelled()
+        if not chunks:
+            _emit_progress(
+                progress_callback,
+                "no_results",
+                "沒有檢索到可用文字區塊。",
+            )
+            return RagResult(INSUFFICIENT_INFORMATION_MESSAGE, [], [])
+
+        retrieved_sources = [
+            _source_details(chunk, number)
+            for number, chunk in enumerate(chunks, start=1)
+        ]
+        retrieved_detail = "\n".join(
+            f"[來源 {source.number}] {source.filename}，第 {source.page_number} 頁"
+            for source in retrieved_sources
+        )
+        _emit_progress(
+            progress_callback,
+            "retrieved",
+            f"已找到 {len(chunks)} 個相關文字區塊。",
+            retrieved_detail,
+        )
+
+        context, sources = format_context(chunks)
+        raise_if_cancelled()
+        _emit_progress(
+            progress_callback,
+            "context",
+            "正在組合帶來源編號的 Context。",
+            f"Context 長度約 {len(context):,} 個字元。",
+        )
+        _emit_progress(
+            progress_callback,
+            "generate",
+            f"正在呼叫 {self.settings.chat_model} 產生回答。",
+        )
+
+        response_stream = self.chat_model.stream(
+            [
+                ("system", SYSTEM_PROMPT),
+                ("human", build_user_prompt(clean_question, context)),
+            ]
+        )
+        try:
+            for response_chunk in response_stream:
+                raise_if_cancelled()
+                text = _chunk_text(response_chunk)
+                if not text:
+                    continue
+                answer_parts.append(text)
+                if token_callback is not None:
+                    token_callback(text)
+            raise_if_cancelled()
+        finally:
+            close_stream = getattr(response_stream, "close", None)
+            if callable(close_stream):
+                close_stream()
+
+        answer = "".join(answer_parts).strip() or INSUFFICIENT_INFORMATION_MESSAGE
         _emit_progress(progress_callback, "complete", "回答產生完成。")
         return RagResult(answer, sources, chunks)

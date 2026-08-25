@@ -2,21 +2,126 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from math import ceil
-from typing import Sequence
+from queue import Empty, Queue
+from threading import Event, Thread
+from typing import Any, Sequence
+from uuid import uuid4
 
 import streamlit as st
 from langchain_core.documents import Document
 
-from src.rag.config import load_settings
+from src.rag.config import Settings, load_settings
 from src.rag.document_loader import (
     PAGE_NUMBER_KEY,
     PDFProcessingError,
     SOURCE_FILENAME_KEY,
     process_uploaded_pdfs,
 )
-from src.rag.rag_service import RagProgressEvent, RagResult, RagService
+from src.rag.rag_service import (
+    RagAnswerCancelled,
+    RagProgressEvent,
+    RagResult,
+    RagService,
+)
 from src.rag.vector_store import create_vector_store
+
+
+ACTIVE_JOB_STATUSES = frozenset({"running", "cancelling"})
+
+
+@dataclass(frozen=True, slots=True)
+class RagJobUpdate:
+    kind: str
+    payload: Any = None
+
+
+@dataclass(slots=True)
+class RagAnswerJob:
+    job_id: str
+    question: str
+    status: str = "running"
+    cancel_event: Event = field(default_factory=Event)
+    updates: Queue[RagJobUpdate] = field(default_factory=Queue)
+    progress_events: list[RagProgressEvent] = field(default_factory=list)
+    partial_answer: str = ""
+    result: RagResult | None = None
+    error: Exception | None = None
+    thread: Thread | None = None
+
+
+def is_job_active(job: RagAnswerJob | None) -> bool:
+    return job is not None and job.status in ACTIVE_JOB_STATUSES
+
+
+def _run_rag_job(
+    job: RagAnswerJob,
+    vector_store: Any,
+    settings: Settings,
+) -> None:
+    """在背景執行問答；此函式不得呼叫任何 Streamlit API。"""
+
+    try:
+        service = RagService(vector_store, settings)
+        result = service.answer_stream(
+            job.question,
+            cancel_event=job.cancel_event,
+            progress_callback=lambda event: job.updates.put(
+                RagJobUpdate("progress", event)
+            ),
+            token_callback=lambda token: job.updates.put(RagJobUpdate("token", token)),
+        )
+        job.updates.put(RagJobUpdate("completed", result))
+    except RagAnswerCancelled as exc:
+        job.updates.put(RagJobUpdate("cancelled", exc.partial_result))
+    except Exception as exc:
+        job.updates.put(RagJobUpdate("failed", exc))
+
+
+def start_rag_job(
+    question: str,
+    vector_store: Any,
+    settings: Settings,
+) -> RagAnswerJob:
+    job = RagAnswerJob(job_id=uuid4().hex, question=question.strip())
+    job.thread = Thread(
+        target=_run_rag_job,
+        args=(job, vector_store, settings),
+        daemon=True,
+        name=f"rag-answer-{job.job_id[:8]}",
+    )
+    job.thread.start()
+    return job
+
+
+def drain_rag_job_updates(job: RagAnswerJob) -> bool:
+    """將背景工作訊息套用至 UI 狀態，回傳本次是否進入終止狀態。"""
+
+    was_active = is_job_active(job)
+    while True:
+        try:
+            update = job.updates.get_nowait()
+        except Empty:
+            break
+
+        if update.kind == "progress":
+            job.progress_events.append(update.payload)
+        elif update.kind == "token":
+            job.partial_answer += str(update.payload)
+        elif update.kind == "completed":
+            job.result = update.payload
+            job.partial_answer = job.result.answer
+            job.status = "completed"
+        elif update.kind == "cancelled":
+            job.result = update.payload
+            job.partial_answer = job.result.answer
+            job.status = "cancelled"
+        elif update.kind == "failed":
+            job.error = update.payload
+            job.status = "failed"
+
+    return was_active and not is_job_active(job)
 
 
 def friendly_error(error: Exception) -> str:
@@ -253,6 +358,93 @@ def render_progress_events(events: Sequence[RagProgressEvent]) -> None:
         render_progress_event(event)
 
 
+def render_question_interface(settings: Settings) -> None:
+    """顯示可在背景執行及取消的文件問答介面。"""
+
+    job: RagAnswerJob | None = st.session_state.get("rag_job")
+    if job is not None and drain_rag_job_updates(job):
+        # 重新完整執行一次，讓外層 fragment 停止自動輪詢。
+        st.rerun()
+
+    job_active = is_job_active(job)
+    question_column, progress_column = st.columns([2.15, 1], gap="large")
+
+    with question_column:
+        st.subheader("文件問答")
+        question = st.text_area(
+            "輸入問題",
+            placeholder="例如：使用生成式 AI 時應注意哪些事項？",
+            key="rag_question_input",
+            disabled=job_active,
+        )
+        submit_column, stop_column = st.columns(2)
+        submit_question = submit_column.button(
+            "送出問題",
+            type="primary",
+            disabled=job_active,
+            use_container_width=True,
+        )
+        stop_question = stop_column.button(
+            "停止回答",
+            disabled=not job_active,
+            use_container_width=True,
+        )
+
+        if submit_question:
+            if not question.strip():
+                st.warning("沒有輸入問題，請先輸入想查詢的內容。")
+            elif "vector_store" not in st.session_state:
+                st.warning("尚未建立知識庫，請先上傳 PDF 並按下「建立知識庫」。")
+            else:
+                st.session_state["rag_job"] = start_rag_job(
+                    question,
+                    st.session_state["vector_store"],
+                    settings,
+                )
+                st.rerun()
+
+        if stop_question and job is not None and is_job_active(job):
+            job.status = "cancelling"
+            job.cancel_event.set()
+            st.rerun()
+
+        if job is not None:
+            if job.status == "cancelling":
+                st.info("正在停止回答……")
+            elif job.status == "cancelled":
+                st.warning("回答已由使用者停止。")
+            elif job.status == "failed" and job.error is not None:
+                st.error(friendly_error(job.error))
+
+            if job.status in ACTIVE_JOB_STATUSES and job.partial_answer:
+                st.subheader("回答（產生中）")
+                st.write(f"{job.partial_answer}▌")
+            elif job.result is not None and (
+                job.status == "completed" or job.result.answer
+            ):
+                render_result(job.result)
+
+    with progress_column:
+        st.subheader("即時流程")
+        if job is None:
+            st.caption("送出問題後，這裡會顯示檢索與回答產生流程。")
+        else:
+            label = {
+                "running": "正在處理問題……",
+                "cancelling": "正在停止回答……",
+                "cancelled": "回答已停止",
+                "completed": "回答完成",
+                "failed": "回答失敗",
+            }.get(job.status, "問答狀態")
+            state = (
+                "running"
+                if job.status in ACTIVE_JOB_STATUSES
+                else "error" if job.status == "failed" else "complete"
+            )
+            with st.status(label, state=state, expanded=True):
+                render_progress_events(job.progress_events)
+
+
 def main() -> None:
     st.set_page_config(page_title="本機 PDF RAG 問答助手", page_icon="📚", layout="wide")
     st.title("本機 PDF RAG 問答助手")
@@ -271,7 +463,12 @@ def main() -> None:
         accept_multiple_files=True,
     )
 
-    if st.button("建立知識庫", type="primary"):
+    current_job: RagAnswerJob | None = st.session_state.get("rag_job")
+    if st.button(
+        "建立知識庫",
+        type="primary",
+        disabled=is_job_active(current_job),
+    ):
         if not uploaded_files:
             st.warning("尚未上傳 PDF，請先選擇至少一份檔案。")
         else:
@@ -295,6 +492,7 @@ def main() -> None:
                     st.session_state.pop(preview_key, None)
                 st.session_state.pop("rag_result", None)
                 st.session_state.pop("rag_progress_events", None)
+                st.session_state.pop("rag_job", None)
                 st.success("知識庫建立完成。")
             except PDFProcessingError as exc:
                 st.error(str(exc))
@@ -312,64 +510,14 @@ def main() -> None:
     question_tab, chunks_tab = st.tabs(["文件問答", "Chunk 預覽"])
 
     with question_tab:
-        question_column, progress_column = st.columns([2.15, 1], gap="large")
+        question_job: RagAnswerJob | None = st.session_state.get("rag_job")
+        poll_interval = "250ms" if is_job_active(question_job) else None
 
-        with question_column:
-            st.subheader("文件問答")
-            question = st.text_area(
-                "輸入問題",
-                placeholder="例如：使用生成式 AI 時應注意哪些事項？",
-            )
-            submit_question = st.button("送出問題", type="primary")
+        @st.fragment(run_every=poll_interval)
+        def question_fragment() -> None:
+            render_question_interface(settings)
 
-        with progress_column:
-            st.subheader("即時流程")
-            progress_placeholder = st.empty()
-
-        if submit_question:
-            if not question.strip():
-                with question_column:
-                    st.warning("沒有輸入問題，請先輸入想查詢的內容。")
-            elif "vector_store" not in st.session_state:
-                with question_column:
-                    st.warning("尚未建立知識庫，請先上傳 PDF 並按下「建立知識庫」。")
-            else:
-                progress_events: list[RagProgressEvent] = []
-                try:
-                    with progress_placeholder.status(
-                        "正在處理問題……", expanded=True
-                    ) as status:
-                        service = RagService(
-                            st.session_state["vector_store"], settings
-                        )
-
-                        def on_progress(event: RagProgressEvent) -> None:
-                            progress_events.append(event)
-                            render_progress_event(event)
-
-                        st.session_state["rag_result"] = service.answer(
-                            question,
-                            progress_callback=on_progress,
-                        )
-                        st.session_state["rag_progress_events"] = progress_events
-                        status.update(label="回答完成", state="complete", expanded=True)
-                except Exception as exc:
-                    st.session_state["rag_progress_events"] = progress_events
-                    with question_column:
-                        st.error(friendly_error(exc))
-
-        with progress_column:
-            if not submit_question:
-                previous_events = st.session_state.get("rag_progress_events", [])
-                if previous_events:
-                    render_progress_events(previous_events)
-                else:
-                    st.caption("送出問題後，這裡會顯示檢索與回答產生流程。")
-
-        result = st.session_state.get("rag_result")
-        if result:
-            with question_column:
-                render_result(result)
+        question_fragment()
 
     with chunks_tab:
         chunks = st.session_state.get("knowledge_chunks")
