@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import Sequence
 
@@ -14,6 +15,15 @@ from .document_loader import SOURCE_FILENAME_KEY
 
 class DatasetError(ValueError):
     """代表 Golden Dataset 無法載入或內容不合法。"""
+
+
+class MissReason(str, Enum):
+    SOURCE_NOT_FOUND = "SOURCE_NOT_FOUND"
+    EXPECTED_TEXT_NOT_IN_PARSED_PDF = "EXPECTED_TEXT_NOT_IN_PARSED_PDF"
+    EXPECTED_TEXT_NOT_IN_ANY_CHUNK = "EXPECTED_TEXT_NOT_IN_ANY_CHUNK"
+    GOLD_CHUNK_NOT_IN_TOP_K = "GOLD_CHUNK_NOT_IN_TOP_K"
+    SOURCE_MISMATCH = "SOURCE_MISMATCH"
+    INTERNAL_EVALUATION_ERROR = "INTERNAL_EVALUATION_ERROR"
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +37,7 @@ class GoldenDatasetItem:
 class RetrievalEvaluationResult:
     item: GoldenDatasetItem
     rank: int | None
+    miss_reason: MissReason | None = None
 
     @property
     def is_hit(self) -> bool:
@@ -35,6 +46,32 @@ class RetrievalEvaluationResult:
     @property
     def reciprocal_rank(self) -> float:
         return 0.0 if self.rank is None else 1.0 / self.rank
+
+
+@dataclass(frozen=True, slots=True)
+class GoldenDatasetCheckResult:
+    item: GoldenDatasetItem
+    source_exists: bool
+    expected_text_in_parsed_pdf: bool
+    expected_text_in_any_chunk: bool = False
+
+    @property
+    def passed_full_text_check(self) -> bool:
+        return self.source_exists and self.expected_text_in_parsed_pdf
+
+    @property
+    def passed_chunk_check(self) -> bool:
+        return self.passed_full_text_check and self.expected_text_in_any_chunk
+
+    @property
+    def miss_reason(self) -> MissReason | None:
+        if not self.source_exists:
+            return MissReason.SOURCE_NOT_FOUND
+        if not self.expected_text_in_parsed_pdf:
+            return MissReason.EXPECTED_TEXT_NOT_IN_PARSED_PDF
+        if not self.expected_text_in_any_chunk:
+            return MissReason.EXPECTED_TEXT_NOT_IN_ANY_CHUNK
+        return None
 
 
 def load_golden_dataset(dataset_path: Path) -> list[GoldenDatasetItem]:
@@ -85,6 +122,80 @@ def load_golden_dataset(dataset_path: Path) -> list[GoldenDatasetItem]:
         items.append(GoldenDatasetItem(**values))
 
     return items
+
+
+def check_golden_dataset_full_text(
+    dataset: Sequence[GoldenDatasetItem],
+    available_sources: Sequence[str],
+    parsed_text_by_source: dict[str, str],
+) -> list[GoldenDatasetCheckResult]:
+    """嚴格檢查 expected_source 與解析後 PDF 全文，不改寫任何文字。"""
+
+    source_names = set(available_sources)
+    return [
+        GoldenDatasetCheckResult(
+            item=item,
+            source_exists=item.expected_source in source_names,
+            expected_text_in_parsed_pdf=(
+                item.expected_source in source_names
+                and item.expected_text
+                in parsed_text_by_source.get(item.expected_source, "")
+            ),
+        )
+        for item in dataset
+    ]
+
+
+def check_chunk_evaluability(
+    checks: Sequence[GoldenDatasetCheckResult],
+    chunks: Sequence[Document],
+) -> list[GoldenDatasetCheckResult]:
+    """嚴格確認 expected_text 完整存在於來源正確的單一 Chunk。"""
+
+    chunks_by_source: dict[str, list[str]] = {}
+    for chunk in chunks:
+        source = chunk.metadata.get(SOURCE_FILENAME_KEY)
+        if isinstance(source, str):
+            chunks_by_source.setdefault(source, []).append(chunk.page_content)
+
+    return [
+        replace(
+            check,
+            expected_text_in_any_chunk=(
+                check.passed_full_text_check
+                and any(
+                    check.item.expected_text in content
+                    for content in chunks_by_source.get(
+                        check.item.expected_source, []
+                    )
+                )
+            ),
+        )
+        for check in checks
+    ]
+
+
+def classify_miss_reason(
+    item: GoldenDatasetItem,
+    retrieved_chunks: Sequence[Document],
+    check: GoldenDatasetCheckResult | None = None,
+) -> MissReason:
+    """依前置檢查與嚴格 Top-K 結果分類 MISS 原因。"""
+
+    if check is not None:
+        precheck_reason = check.miss_reason
+        if precheck_reason is not None:
+            return precheck_reason
+        # 已確認正確 Chunk 存在，但嚴格比對仍未命中 Top-K。
+        return MissReason.GOLD_CHUNK_NOT_IN_TOP_K
+
+    if any(
+        item.expected_text in chunk.page_content
+        and chunk.metadata.get(SOURCE_FILENAME_KEY) != item.expected_source
+        for chunk in retrieved_chunks
+    ):
+        return MissReason.SOURCE_MISMATCH
+    return MissReason.INTERNAL_EVALUATION_ERROR
 
 
 def evaluate_retrieved_chunks(

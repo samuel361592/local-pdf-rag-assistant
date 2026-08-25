@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from collections import Counter
 from io import BytesIO
 from pathlib import Path
 from time import perf_counter
@@ -18,12 +19,24 @@ from src.rag.config import Settings, load_settings
 from src.rag.document_loader import PDFProcessingError, process_uploaded_pdfs
 from src.rag.evaluation import (
     DatasetError,
+    GoldenDatasetCheckResult,
     GoldenDatasetItem,
+    MissReason,
     RetrievalEvaluationResult,
     calculate_hit_rate_at_k,
     calculate_mrr,
+    check_chunk_evaluability,
+    check_golden_dataset_full_text,
+    classify_miss_reason,
     evaluate_retrieved_chunks,
     load_golden_dataset,
+)
+from src.rag.evaluation_cache import (
+    EvaluationCacheError,
+    build_evaluation_cache_signature,
+    evaluation_cache_directory,
+    load_evaluation_cache,
+    save_evaluation_cache,
 )
 from src.rag.vector_store import (
     create_embeddings,
@@ -34,6 +47,7 @@ from src.rag.vector_store import (
 EVALUATION_DOCUMENTS_DIR = PROJECT_ROOT / "documents" / "evaluation"
 DATASET_PATH = PROJECT_ROOT / "evaluation" / "dataset.json"
 ENV_PATH = PROJECT_ROOT / ".env"
+EVALUATION_CACHE_ROOT = PROJECT_ROOT / "storage" / "retrieval_evaluation"
 REQUIRED_ENV_KEYS = (
     "OLLAMA_BASE_URL",
     "EMBEDDING_MODEL",
@@ -152,27 +166,84 @@ def evaluate_questions(
     vector_store: object,
     dataset: list[GoldenDatasetItem],
     top_k: int,
+    checks: list[GoldenDatasetCheckResult] | None = None,
 ) -> list[RetrievalEvaluationResult]:
+    if checks is not None and len(checks) != len(dataset):
+        raise ValueError("Golden Dataset 與前置檢查結果數量不一致。")
+
     results: list[RetrievalEvaluationResult] = []
     total_questions = len(dataset)
     for index, item in enumerate(dataset, start=1):
         report_progress(f"Evaluating question {index} of {total_questions}.")
         print(f"Question: {item.question}")
-        chunks = similarity_search(vector_store, item.question, top_k)
-        result = evaluate_retrieved_chunks(item, chunks)
+        check = checks[index - 1] if checks is not None else None
+        try:
+            chunks = similarity_search(vector_store, item.question, top_k)
+            strict_result = evaluate_retrieved_chunks(item, chunks)
+            if strict_result.is_hit:
+                result = strict_result
+            else:
+                result = RetrievalEvaluationResult(
+                    item=item,
+                    rank=None,
+                    miss_reason=classify_miss_reason(item, chunks, check),
+                )
+        except Exception as exc:
+            result = RetrievalEvaluationResult(
+                item=item,
+                rank=None,
+                miss_reason=MissReason.INTERNAL_EVALUATION_ERROR,
+            )
+            detail = str(exc).strip() or type(exc).__name__
+            print(f"Internal Error: {detail}")
         results.append(result)
 
-        if result.is_hit:
-            print("Result: HIT")
-            print(f"Rank: {result.rank}")
-            print(f"Source: {item.expected_source}")
-        else:
-            print("Result: MISS")
-            print(f"Expected Source: {item.expected_source}")
+        print(f"Result: {'HIT' if result.is_hit else 'MISS'}")
+        print(f"Rank: {result.rank if result.rank is not None else 'N/A'}")
+        print(f"Source: {item.expected_source}")
+        print(
+            "MISS Reason: "
+            f"{result.miss_reason.value if result.miss_reason else 'N/A'}"
+        )
+        if not result.is_hit:
             print(f"Expected Text: {item.expected_text}")
         print(flush=True)
 
     return results
+
+
+def print_precheck_results(checks: list[GoldenDatasetCheckResult]) -> None:
+    print("Golden Dataset Precheck:")
+    full_text_failures = [
+        check for check in checks if not check.passed_full_text_check
+    ]
+    if not full_text_failures:
+        print("All questions passed the parsed PDF full-text check.")
+    for number, check in enumerate(checks, start=1):
+        if check.passed_full_text_check:
+            continue
+        print(f"Question Number: {number}")
+        print(f"Source: {check.item.expected_source}")
+        print(f"Expected Text: {check.item.expected_text}")
+        print(f"Error Reason: {check.miss_reason.value}")
+        print()
+
+    print("Chunk Evaluability Check:")
+    chunk_boundary_failures = [
+        (number, check)
+        for number, check in enumerate(checks, start=1)
+        if check.passed_full_text_check and not check.passed_chunk_check
+    ]
+    if not chunk_boundary_failures:
+        print("All full-text-valid questions passed the Chunk evaluability check.")
+    for number, check in chunk_boundary_failures:
+        print(f"Question Number: {number}")
+        print(f"Source: {check.item.expected_source}")
+        print(f"Expected Text: {check.item.expected_text}")
+        print(f"Error Reason: {MissReason.EXPECTED_TEXT_NOT_IN_ANY_CHUNK.value}")
+        print("Possible Cause: expected text may cross a Chunk boundary.")
+        print()
+    print(flush=True)
 
 
 def print_summary(
@@ -180,9 +251,27 @@ def print_summary(
     document_count: int,
     settings: Settings,
     results: list[RetrievalEvaluationResult],
+    checks: list[GoldenDatasetCheckResult] | None = None,
+    cache_used: bool = False,
+    cache_directory: Path | None = None,
 ) -> None:
     mrr = calculate_mrr(results)
     report_cutoffs = sorted({*HIT_RATE_CUTOFFS, settings.top_k})
+    passed_full_text_count = (
+        sum(check.passed_full_text_check for check in checks)
+        if checks is not None
+        else len(results)
+    )
+    passed_chunk_count = (
+        sum(check.passed_chunk_check for check in checks)
+        if checks is not None
+        else len(results)
+    )
+    miss_reason_counts = Counter(
+        result.miss_reason or MissReason.INTERNAL_EVALUATION_ERROR
+        for result in results
+        if not result.is_hit
+    )
 
     print("================================")
     print("Retrieval Evaluation")
@@ -190,16 +279,38 @@ def print_summary(
     print()
     print(f"Documents: {document_count}")
     print(f"Questions: {len(results)}")
+    print(f"Golden Dataset Questions: {len(results)}")
+    print(f"Passed Parsed PDF Check: {passed_full_text_count}")
+    print(f"Passed Chunk Evaluability Check: {passed_chunk_count}")
     print(f"Top-K: {settings.top_k}")
+    print(f"FAISS Cache Used: {'YES' if cache_used else 'NO'}")
+    print(f"FAISS Cache Status: {'LOADED' if cache_used else 'REBUILT'}")
+    if cache_directory is not None:
+        print(f"FAISS Cache Directory: {cache_directory}")
     print()
     for cutoff in report_cutoffs:
         hit_rate = calculate_hit_rate_at_k(results, cutoff)
         print(f"Hit Rate@{cutoff}: {hit_rate:.2%}")
     print(f"MRR: {mrr:.2f}")
     print()
+    print("MISS Reasons:")
+    for reason in MissReason:
+        print(f"{reason.value}: {miss_reason_counts[reason]}")
+    print()
     print(f"Embedding Model: {settings.embedding_model}")
     print(f"Chunk Size: {settings.chunk_size}")
     print(f"Chunk Overlap: {settings.chunk_overlap}")
+    print()
+    print("Question Results:")
+    for number, result in enumerate(results, start=1):
+        print(f"Question Number: {number}")
+        print(f"Result: {'HIT' if result.is_hit else 'MISS'}")
+        print(f"Rank: {result.rank if result.rank is not None else 'N/A'}")
+        print(f"Source: {result.item.expected_source}")
+        print(
+            "MISS Reason: "
+            f"{result.miss_reason.value if result.miss_reason else 'N/A'}"
+        )
 
 
 def run_evaluation() -> None:
@@ -226,35 +337,94 @@ def run_evaluation() -> None:
     dataset = load_golden_dataset(DATASET_PATH)
     report_progress(f"Loaded {len(dataset)} questions.")
 
-    report_progress("Reading and chunking PDF documents.")
-    pdf_files = open_evaluation_pdfs(pdf_paths)
+    report_progress("Calculating PDF and index setting hashes.")
+    cache_signature = build_evaluation_cache_signature(
+        pdf_paths,
+        settings,
+        vector_dimensions,
+    )
+    cache_dir = evaluation_cache_directory(
+        EVALUATION_CACHE_ROOT,
+        cache_signature,
+    )
+    vector_store: object | None = None
+    batch = None
+    cache_used = False
     try:
-        batch = process_uploaded_pdfs(pdf_files, settings)
-    finally:
-        for pdf_file in pdf_files:
-            pdf_file.close()
+        cached_artifacts = load_evaluation_cache(
+            EVALUATION_CACHE_ROOT,
+            cache_signature,
+            embedding_client,
+        )
+    except EvaluationCacheError as exc:
+        report_progress(f"FAISS cache load failed; rebuilding safely. Reason: {exc}")
+        cached_artifacts = None
+    if cached_artifacts is not None:
+        vector_store = cached_artifacts.vector_store
+        batch = cached_artifacts.batch
+        cache_used = True
+        report_progress(f"Loaded FAISS index from cache: {cache_dir}")
+    else:
+        report_progress("No valid FAISS cache found; rebuilding the index.")
+        report_progress("Reading and chunking PDF documents.")
+        pdf_files = open_evaluation_pdfs(pdf_paths)
+        try:
+            batch = process_uploaded_pdfs(pdf_files, settings)
+        finally:
+            for pdf_file in pdf_files:
+                pdf_file.close()
 
+    if batch is None:
+        raise EvaluationSetupError("PDF 解析或快取載入後沒有可評估的文件資料。")
     report_progress(
         f"Created {len(batch.chunks)} chunks from {batch.page_count} pages."
     )
-    report_progress(
-        f"Creating the FAISS vector store with {settings.embedding_model}. "
-        "Embedding may take some time."
+    full_text_checks = check_golden_dataset_full_text(
+        dataset,
+        [path.name for path in pdf_paths],
+        batch.parsed_text_by_source,
     )
-    vector_store = create_vector_store(
-        batch.chunks,
-        settings,
-        embeddings=embedding_client,
-    )
-    report_progress("FAISS vector store is ready.")
+    checks = check_chunk_evaluability(full_text_checks, batch.chunks)
+    print_precheck_results(checks)
+
+    if vector_store is None:
+        report_progress(
+            f"Creating the FAISS vector store with {settings.embedding_model}. "
+            "Embedding may take some time."
+        )
+        vector_store = create_vector_store(
+            batch.chunks,
+            settings,
+            embeddings=embedding_client,
+        )
+        report_progress("FAISS vector store is ready.")
+        try:
+            saved_cache_dir = save_evaluation_cache(
+                EVALUATION_CACHE_ROOT,
+                cache_signature,
+                vector_store,
+                batch,
+            )
+        except EvaluationCacheError as exc:
+            report_progress(f"FAISS index rebuilt, but cache save failed: {exc}")
+        else:
+            report_progress(f"Saved FAISS index cache: {saved_cache_dir}")
 
     report_progress("Starting question evaluation.")
-    results = evaluate_questions(vector_store, dataset, settings.top_k)
+    results = evaluate_questions(
+        vector_store,
+        dataset,
+        settings.top_k,
+        checks,
+    )
     report_progress("Calculating final metrics.")
     print_summary(
         document_count=batch.document_count,
         settings=settings,
         results=results,
+        checks=checks,
+        cache_used=cache_used,
+        cache_directory=cache_dir,
     )
     elapsed_seconds = perf_counter() - started_at
     report_progress(f"Evaluation completed in {elapsed_seconds:.1f} seconds.")

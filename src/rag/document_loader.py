@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import BinaryIO, Sequence
 
@@ -16,6 +17,8 @@ from .config import Settings
 SOURCE_FILENAME_KEY = "source_filename"
 PAGE_NUMBER_KEY = "page_number"
 CHINESE_SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
+PDF_PROCESSING_CACHE_VERSION = 1
+SPLITTER_ADD_START_INDEX = True
 
 
 class PDFProcessingError(RuntimeError):
@@ -27,6 +30,38 @@ class DocumentBatch:
     document_count: int
     page_count: int
     chunks: list[Document]
+    parsed_text_by_source: dict[str, str] = field(default_factory=dict)
+
+
+def _package_version(distribution_name: str) -> str:
+    try:
+        return version(distribution_name)
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def pdf_processing_cache_settings(settings: Settings) -> dict[str, object]:
+    """回傳所有會影響 PDF 解析、Metadata 或 Chunk 內容的快取設定。"""
+
+    return {
+        "cache_version": PDF_PROCESSING_CACHE_VERSION,
+        "pdf_loader": "langchain_community.document_loaders.PyPDFLoader",
+        "text_splitter": (
+            "langchain_text_splitters.RecursiveCharacterTextSplitter"
+        ),
+        "pypdf_version": _package_version("pypdf"),
+        "langchain_community_version": _package_version("langchain-community"),
+        "langchain_text_splitters_version": _package_version(
+            "langchain-text-splitters"
+        ),
+        "chunk_size": settings.chunk_size,
+        "chunk_overlap": settings.chunk_overlap,
+        "separators": CHINESE_SEPARATORS,
+        "add_start_index": SPLITTER_ADD_START_INDEX,
+        "source_filename_key": SOURCE_FILENAME_KEY,
+        "page_number_key": PAGE_NUMBER_KEY,
+        "page_number_base": 1,
+    }
 
 
 def _read_upload(uploaded_file: BinaryIO) -> bytes:
@@ -81,7 +116,7 @@ def split_pdf_pages(
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
         separators=CHINESE_SEPARATORS,
-        add_start_index=True,
+        add_start_index=SPLITTER_ADD_START_INDEX,
     )
     return splitter.split_documents(normalized_pages)
 
@@ -92,6 +127,7 @@ def process_uploaded_pdfs(
     """解析多份 PDF 並回傳統計資料與全部文字區塊。"""
 
     all_chunks: list[Document] = []
+    parsed_text_by_source: dict[str, str] = {}
     total_pages = 0
     for uploaded_file in uploaded_files:
         filename = getattr(uploaded_file, "name", "未命名.pdf")
@@ -101,9 +137,18 @@ def process_uploaded_pdfs(
             raise PDFProcessingError(
                 f"PDF「{filename}」沒有可解析的文字；掃描型 PDF 可能需要先進行 OCR。"
             )
+        parsed_text = "\n".join(page.page_content for page in pages)
+        if filename in parsed_text_by_source:
+            parsed_text = f"{parsed_text_by_source[filename]}\n{parsed_text}"
+        parsed_text_by_source[filename] = parsed_text
         chunks = split_pdf_pages(pages, filename, settings)
         all_chunks.extend(chunk for chunk in chunks if chunk.page_content.strip())
 
     if not all_chunks:
         raise PDFProcessingError("PDF 沒有可建立索引的文字；掃描型 PDF 可能需要先進行 OCR。")
-    return DocumentBatch(len(uploaded_files), total_pages, all_chunks)
+    return DocumentBatch(
+        len(uploaded_files),
+        total_pages,
+        all_chunks,
+        parsed_text_by_source,
+    )

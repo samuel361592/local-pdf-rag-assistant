@@ -197,7 +197,11 @@ python scripts/evaluate_retrieval.py
 
 每次執行時，Script 都會重新載入專案根目錄的 `.env`，顯示本次實際採用的設定，並先驗證 Ollama 連線與 Embedding 模型能否產生向量。環境檢查通過後才會解析 PDF 和建立索引，因此模型名稱錯誤或 Ollama 未啟動時會立即停止並顯示原因。
 
-Script 會沿用正式 RAG 的 PDF parser、Chunking、Ollama Embedding、FAISS 建索引與 `similarity_search()`，但不會呼叫聊天模型。Evaluation 依 `.env` 的 `TOP_K` 取回 Chunk；為了計算固定的 Hit Rate@1、@3、@5、@8，`TOP_K` 必須至少為 8。輸出包含逐題最早命中排名、固定門檻與設定 Top-K 的 Hit Rate、MRR，以及 Embedding Model、Chunk Size、Chunk Overlap 等實驗設定。
+Script 會沿用正式 RAG 的 PDF parser、Chunking、Ollama Embedding、FAISS 建索引與 `similarity_search()`，但不會呼叫聊天模型。Evaluation 依 `.env` 的 `TOP_K` 取回 Chunk；為了計算固定的 Hit Rate@1、@3、@5、@8，`TOP_K` 必須至少為 8。正式判定仍以 `expected_source` 與 `expected_text` 的嚴格字串比對為準，不會做文字正規化、模糊或語意比對。
+
+正式評估前會先確認每題來源 PDF、解析全文中的 `expected_text`，以及來源正確的單一 Chunk 是否完整包含該文字。輸出會列出未通過題號及 `SOURCE_NOT_FOUND`、`EXPECTED_TEXT_NOT_IN_PARSED_PDF`、`EXPECTED_TEXT_NOT_IN_ANY_CHUNK` 等原因；可評估題目若正確 Chunk 未進入 Top-K，會記為 `GOLD_CHUNK_NOT_IN_TOP_K`。摘要包含通過檢查題數、各 MISS 原因、逐題 Result/Rank/Source/MISS Reason、Hit Rate 與以全部題目為分母的 MRR。
+
+Evaluation 專用 FAISS 快取位於 `storage/retrieval_evaluation/<cache-key>/`，包含 `index.faiss`、`documents.json` 與 `manifest.json`。快取鍵由 PDF 檔名與內容 SHA-256，以及 Embedding 模型、Embedding 維度、Chunk Size、Chunk Overlap、切分符號、Metadata/頁碼設定、PDF loader 與相關解析套件版本共同決定；任一項變更都會自動改用新快取並重建。載入時也會驗證檔案雜湊、向量維度及 Chunk 數量，失敗時安全重建。這個磁碟快取只用於 Retrieval Evaluation，不改變 Streamlit 工作階段內索引的既有行為。
 
 未來可用同一組固定 PDF 與 Golden Dataset 比較 Chunk Size、Chunk Overlap、Embedding Model、Hybrid Search 或 Reranker；本版僅實作既有 FAISS Vector Similarity Search baseline。
 

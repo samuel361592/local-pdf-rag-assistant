@@ -63,7 +63,7 @@
   {
     "question": "組織應該把 AI 風險當成獨立問題處理，還是納入既有企業風險管理？",
     "expected_source": "NIST.AI.100-1.pdf",
-    "expected_text": "broader enterprise risk management strategies and processes"
+    "expected_text": "AI risks should not be considered in isolation"
   },
   {
     "question": "生成式 AI 為什麼可能讓既有的社會偏見造成更大範圍的傷害？",
