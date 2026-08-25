@@ -406,7 +406,8 @@ def render_question_interface(settings: Settings) -> None:
         if stop_question and job is not None and is_job_active(job):
             job.status = "cancelling"
             job.cancel_event.set()
-            st.rerun()
+            # 立即更新停止狀態，但不讓完整 App rerun 使 Fragment ID 失效。
+            st.rerun(scope="fragment")
 
         if job is not None:
             if job.status == "cancelling":
