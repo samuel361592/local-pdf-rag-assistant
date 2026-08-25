@@ -1,0 +1,154 @@
+[
+  {
+    "question": "AI RMF Core 在最高層級用哪四個功能來組織 AI 風險管理活動？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "govern, map, measure, and manage AI risks"
+  },
+  {
+    "question": "依 EO 14110 的定義，Generative AI 會根據輸入資料產生什麼類型的內容？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "generate derived synthetic content"
+  },
+  {
+    "question": "NIST AI RMF 是強制要求組織遵循的規範嗎？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "voluntary, rights-preserving, non-sector-specific"
+  },
+  {
+    "question": "GAI 的 CBRN 風險涉及哪些四類危險領域？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "chemical, biological, radiological, or nuclear"
+  },
+  {
+    "question": "組織的 AI 風險容忍度是否由 AI RMF 統一規定？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "does not prescribe risk tolerance"
+  },
+  {
+    "question": "當生成式 AI 很有自信地產生錯誤或虛假內容時，NIST 如何描述這種現象？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "erroneous or false content in response to prompts"
+  },
+  {
+    "question": "AI RMF 中哪個治理功能會貫穿其他風險管理功能？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "GOVERN is a cross-cutting function"
+  },
+  {
+    "question": "為什麼訓練、維護與執行生成式 AI 可能帶來龐大的能源與環境負擔？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "resource-intensive activities"
+  },
+  {
+    "question": "完成 AI RMF 的 MAP 階段後，組織應能對 AI 系統做出哪種初步決策？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "initial go/no-go decision"
+  },
+  {
+    "question": "GAI 的智慧財產權風險是否包含未經授權產生或複製授權內容？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "licensed content without authorization"
+  },
+
+  {
+    "question": "NIST 對 risk 的定義除了事件發生的可能性之外，還考量什麼？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "the magnitude or degree of the consequences"
+  },
+  {
+    "question": "GAI 模型除了可能洩漏個資之外，還可能對個人的敏感資訊做出什麼行為？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "leak, generate, or correctly infer sensitive information"
+  },
+  {
+    "question": "組織應該把 AI 風險當成獨立問題處理，還是納入既有企業風險管理？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "broader enterprise risk management strategies and processes"
+  },
+  {
+    "question": "生成式 AI 為什麼可能讓既有的社會偏見造成更大範圍的傷害？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "perpetuating and amplifying harms"
+  },
+  {
+    "question": "NIST 修改 OECD 的 AI lifecycle 架構時，特別強調哪一組測試與驗證流程？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "test, evaluation, verification, and validation (TEVV) processes"
+  },
+  {
+    "question": "人類與 GAI 互動時，可能出現排斥自動化、過度信任或過度依賴等哪些問題？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "algorithmic aversion, automation bias, over-reliance"
+  },
+  {
+    "question": "AI RMF 在分析與監控 AI 風險時，可同時使用哪些類型的研究方法？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "quantitative, qualitative, or mixed-method"
+  },
+  {
+    "question": "生成式 AI 大量產生內容時，為什麼可能降低資訊的可信度與完整性？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "may not distinguish fact from opinion"
+  },
+  {
+    "question": "AI RMF 的 Current Profile 主要描述組織目前如何管理 AI 及其風險，對嗎？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "managed and the related risks in terms of current outcomes"
+  },
+  {
+    "question": "GAI 為什麼可能降低駭客尋找並利用系統漏洞的門檻？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "discovery and exploitation of vulnerabilities to ease hacking"
+  },
+
+  {
+    "question": "如果 AI 系統的負面風險已達不可接受程度，在風險尚未受到控制前應如何處理？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "should cease in a safe manner until risks can be sufficiently managed"
+  },
+  {
+    "question": "GAI 風險不只會在模型開發時產生，還可能橫跨哪些生命週期階段？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "design, development, deployment, operation"
+  },
+  {
+    "question": "在 trustworthy AI 的特性中，哪一項要求組織同時重視責任歸屬與透明度？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "accountable and transparent"
+  },
+  {
+    "question": "當某種 AI 技術或業務流程會跨越不同產業共同使用時，Cross-sectoral Profile 主要管理哪類風險？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "risks associated with activities or business processes common across sectors"
+  },
+  {
+    "question": "MANAGE 階段要求組織記錄經過風險處置後仍然沒有被消除的哪一類風險？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "Negative residual risks"
+  },
+  {
+    "question": "如果生成式 AI 更容易產生煽動、激進化或威脅性內容，這屬於哪類內容風險的典型描述？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "inciting, radicalizing, or threatening"
+  },
+  {
+    "question": "如果組織要針對招聘、住房或其他特定應用情境建立 AI RMF Profile，這類 Profile 是依什麼建立？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "specific setting or application"
+  },
+  {
+    "question": "生成式 AI 使用外部模型、資料或供應商時，哪一類上游元件問題可能造成透明度與責任追蹤困難？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "upstream third-party components"
+  },
+  {
+    "question": "NIST 對 AI RMF 所提出的第一項設計屬性，同時強調風險導向、資源效率、創新與什麼原則？",
+    "expected_source": "NIST.AI.100-1.pdf",
+    "expected_text": "risk-based, resource-efficient, pro-innovation, and voluntary"
+  },
+  {
+    "question": "GAI Public Working Group 特別關注系統正式部署之前進行風險驗證與測試，這項 consideration 稱為什麼？",
+    "expected_source": "NIST.AI.600-1.pdf",
+    "expected_text": "Pre-deployment Testing"
+  }
+]

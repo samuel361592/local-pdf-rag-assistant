@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
+
+
+PROJECT_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,10 +40,17 @@ def _read_int(name: str, default: int) -> int:
         raise ValueError(f"{name} 必須是整數，目前值為 {raw_value!r}。") from exc
 
 
-def load_settings() -> Settings:
+def load_settings(
+    *,
+    env_path: Path | None = None,
+    override_env: bool = False,
+) -> Settings:
     """從 .env 與環境變數建立並驗證設定。"""
 
-    load_dotenv()
+    load_dotenv(
+        dotenv_path=env_path or PROJECT_ENV_PATH,
+        override=override_env,
+    )
     defaults = Settings()
     return Settings(
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", defaults.ollama_base_url),

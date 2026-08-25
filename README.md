@@ -53,14 +53,23 @@ qwen3:4b 根據 Context 產生回答
 ```text
 local-pdf-rag-assistant/
 ├── app.py
+├── scripts/
+│   ├── download_evaluation_pdfs.ps1
+│   └── evaluate_retrieval.py
+├── evaluation/
+│   └── dataset.json
 ├── src/rag/
 │   ├── config.py
 │   ├── document_loader.py
+│   ├── evaluation.py
 │   ├── vector_store.py
 │   ├── prompt.py
 │   └── rag_service.py
 ├── tests/
 ├── documents/
+│   └── evaluation/
+│       ├── NIST.AI.100-1.pdf
+│       └── NIST.AI.600-1.pdf
 ├── storage/
 ├── .env.example
 ├── .gitignore
@@ -73,6 +82,7 @@ local-pdf-rag-assistant/
 - `app.py`：Streamlit 入口，負責畫面呈現、上傳流程、知識庫建立、問答操作與結果顯示。
 - `src/rag/config.py`：讀取 `.env` 與環境變數，集中管理 Ollama、模型、Chunk 與檢索參數。
 - `src/rag/document_loader.py`：處理 PDF 上傳內容、解析頁面文字、整理來源檔名與頁碼，並切分 Chunks。
+- `src/rag/evaluation.py`：驗證 Golden Dataset、判定 Retrieval Hit，並計算 Hit Rate@1、@3、@5、@8 與 MRR。
 - `src/rag/vector_store.py`：建立 Ollama Embedding client，將 Chunks 寫入 FAISS，並提供相似度搜尋。
 - `src/rag/prompt.py`：集中管理系統提示詞與使用者提示詞格式，限制模型只能根據文件內容回答。
 - `src/rag/rag_service.py`：協調檢索、Context 格式化、呼叫聊天模型與回傳回答來源。
@@ -150,8 +160,46 @@ python -m pytest
 也可進行 Python 語法檢查：
 
 ```powershell
-python -m compileall app.py src tests
+python -m compileall app.py src tests scripts
 ```
+
+## RAG Retrieval Evaluation
+
+本專案提供一套與 Streamlit UI 完全分離的 Retrieval benchmark，用固定的
+`documents/evaluation/*.pdf` 評估目前 FAISS Vector Similarity Search baseline。固定文件可讓每次調整參數後都使用相同語料，避免上傳內容不同而使實驗結果無法比較；正式問答流程仍只處理使用者在 Streamlit 上傳的 PDF，不會自動載入 benchmark 文件。
+
+`evaluation/dataset.json` 是 Golden Dataset。每筆資料包含送進 Retriever 的 `question`、正確 Chunk 所屬的 `expected_source`，以及該 Chunk 必須包含的 `expected_text`。只有同一個取回的 Chunk 同時符合來源檔名與關鍵文字才算 Hit。
+
+- **Hit Rate@1、@3、@5、@8、@TOP_K**：依正確 Chunk 最早出現的排名，計算位於各排名門檻內的題數比例；`@TOP_K` 使用 `.env` 設定值，若與固定門檻相同則只顯示一次。
+- **MRR**（Mean Reciprocal Rank）：每題第一個正確 Chunk 排名的倒數平均；Rank 1 為 `1`、Rank 2 為 `0.5`，設定的 Top-K 中沒有正確 Chunk 則為 `0`。
+
+Evaluation PDF 不會提交到 Git。第一次執行前，請從專案根目錄下載 NIST 官方文件並驗證 SHA-256：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/download_evaluation_pdfs.ps1
+```
+
+若檔案已存在且雜湊正確，腳本會直接跳過下載；若雜湊不同，只有在新檔案通過驗證後才會取代原檔。文件來源為 [NIST AI 100-1](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-1.pdf) 與 [NIST AI 600-1](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.600-1.pdf)。請保留 NIST 文件名稱與來源標示。
+
+下載完成後，兩份固定文件會位於：
+
+```text
+documents/evaluation/
+├── NIST.AI.100-1.pdf
+└── NIST.AI.600-1.pdf
+```
+
+確認 Ollama 已啟動且已安裝 `.env` 指定的 Embedding 模型後，在專案根目錄執行：
+
+```powershell
+python scripts/evaluate_retrieval.py
+```
+
+每次執行時，Script 都會重新載入專案根目錄的 `.env`，顯示本次實際採用的設定，並先驗證 Ollama 連線與 Embedding 模型能否產生向量。環境檢查通過後才會解析 PDF 和建立索引，因此模型名稱錯誤或 Ollama 未啟動時會立即停止並顯示原因。
+
+Script 會沿用正式 RAG 的 PDF parser、Chunking、Ollama Embedding、FAISS 建索引與 `similarity_search()`，但不會呼叫聊天模型。Evaluation 依 `.env` 的 `TOP_K` 取回 Chunk；為了計算固定的 Hit Rate@1、@3、@5、@8，`TOP_K` 必須至少為 8。輸出包含逐題最早命中排名、固定門檻與設定 Top-K 的 Hit Rate、MRR，以及 Embedding Model、Chunk Size、Chunk Overlap 等實驗設定。
+
+未來可用同一組固定 PDF 與 Golden Dataset 比較 Chunk Size、Chunk Overlap、Embedding Model、Hybrid Search 或 Reranker；本版僅實作既有 FAISS Vector Similarity Search baseline。
 
 ## 測試問題建議
 
