@@ -15,6 +15,8 @@
 - RecursiveCharacterTextSplitter：將長文本依段落、換行與中文標點切成適合檢索的 Chunks。
 - Ollama：在本機執行 Embedding 模型與聊天模型。
 - bge-m3：Embedding 模型，負責將文字 Chunk 轉成語意向量。
+- FlagEmbedding：載入 Hugging Face Reranker 並計算 query/document 相關性分數。
+- BAAI/bge-reranker-v2-m3：第二階段重排模型，將 FAISS 候選 Chunk 重新評分與排序。
 - qwen3:4b：聊天模型，負責根據檢索到的文件內容產生繁體中文回答。
 - FAISS：向量資料庫，用於儲存文字向量並執行相似度搜尋。
 - python-dotenv：讀取 `.env` 設定檔。
@@ -37,6 +39,10 @@ FAISS 建立向量索引
   ↓
 FAISS 取回相關 Chunk
   ↓
+BAAI/bge-reranker-v2-m3 重新評分與排序
+  ↓
+取重排後前 TOP_K 個 Chunk 並組成 Context
+  ↓
 qwen3:4b 根據 Context 產生回答
 ```
 
@@ -44,9 +50,12 @@ qwen3:4b 根據 Context 產生回答
 2. 保留原始檔名、頁碼與解析方式，再依中文標點切分文字。
 3. 透過 Ollama 的 `bge-m3` 產生 Embedding。
 4. 將向量存入本次 Streamlit Session State 內的 FAISS 索引。
-5. 問答時取回最相關的 Chunk，組成帶來源編號的 Context。
-6. 由 Ollama 的 `qwen3:4b` 僅根據 Context 產生繁體中文回答。
-7. 送出問題後，介面右側會顯示即時流程，包括檢索 Chunk、組合 Context、呼叫模型與回答完成狀態。
+5. 問答時先由 FAISS 取回 `RETRIEVAL_TOP_K` 個候選 Chunk。
+6. 啟用 Reranker 時，以 `BAAI/bge-reranker-v2-m3` 重排候選，僅取前 `TOP_K` 個組成帶來源編號的 Context；停用時則維持直接取 FAISS 前 `TOP_K` 個的既有流程。
+7. 由 Ollama 的 `qwen3:4b` 僅根據重排後的 Context 產生繁體中文回答。
+8. 送出問題後，介面右側會顯示 Retrieval、Rerank、Context 組合、模型產生與完成狀態。
+
+Embedding 與 Reranker 的用途不同：Embedding 將問題與 Chunk 轉成向量，讓 FAISS 快速找出候選集合；Reranker 直接比較問題與候選文字，進行較精細但較耗時的第二階段排序。Reranker 由 Python 的 FlagEmbedding 載入 Hugging Face 模型，不透過 Ollama。
 
 索引只存在目前的 Streamlit 工作階段，重新啟動應用程式後需重新上傳並建立知識庫。本版不會載入或寫出 FAISS pickle 檔案。
 
@@ -64,10 +73,13 @@ local-rag-assistant/
 │   ├── config.py
 │   ├── document_loader.py
 │   ├── evaluation.py
+│   ├── evaluation_cache.py
+│   ├── reranker.py
 │   ├── vector_store.py
 │   ├── prompt.py
 │   └── rag_service.py
 ├── tests/
+│   └── test_reranker.py
 ├── documents/
 │   └── .gitkeep
 ├── storage/
@@ -85,6 +97,7 @@ local-rag-assistant/
 - `src/rag/ocr_service.py`：使用 PyMuPDF 將 PDF 頁面轉成圖片，並用 PaddleOCR 辨識文字。
 - `src/rag/evaluation.py`：驗證 Golden Dataset、判定 Retrieval Hit，並計算 Hit Rate@1、@3、@5、@8 與 MRR。
 - `src/rag/vector_store.py`：建立 Ollama Embedding client，將 Chunks 寫入 FAISS，並提供相似度搜尋。
+- `src/rag/reranker.py`：延遲載入並快取 FlagEmbedding Reranker，負責第二階段評分與穩定排序。
 - `src/rag/prompt.py`：集中管理系統提示詞與使用者提示詞格式，限制模型只能根據文件內容回答。
 - `src/rag/rag_service.py`：協調檢索、Context 格式化、呼叫聊天模型與回傳回答來源。
 - `tests/`：放置單元測試，涵蓋文件處理、Context 格式化與 Chunk 預覽分頁等邏輯。
@@ -127,6 +140,10 @@ EMBEDDING_MODEL=bge-m3
 CHAT_MODEL=qwen3:4b
 CHUNK_SIZE=500
 CHUNK_OVERLAP=80
+RERANKER_ENABLED=true
+RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+RERANKER_USE_FP16=false
+RETRIEVAL_TOP_K=20
 TOP_K=4
 OCR_MODE=auto
 OCR_LANG=ch
@@ -140,7 +157,11 @@ OCR_ENABLE_IMAGES=true
 - `CHAT_MODEL`：聊天模型名稱，用於根據檢索到的 Context 產生回答。
 - `CHUNK_SIZE`：每個 Chunk 的目標字元數。
 - `CHUNK_OVERLAP`：相鄰 Chunk 的重疊字元數，用於保留上下文連續性。
-- `TOP_K`：問答時取回最相關的 Chunk 數量。
+- `RERANKER_ENABLED`：是否啟用第二階段重排。設為 `false` 時不會載入 FlagEmbedding 或 Hugging Face 模型。
+- `RERANKER_MODEL`：Hugging Face Reranker 模型名稱，預設 `BAAI/bge-reranker-v2-m3`。
+- `RERANKER_USE_FP16`：是否使用 FP16；CPU 環境預設為 `false`。
+- `RETRIEVAL_TOP_K`：FAISS 第一階段取回的候選 Chunk 數量，必須大於或等於 `TOP_K`。
+- `TOP_K`：重排後真正提供給 Context 與 LLM 的 Chunk 數量。停用 Reranker 時則是 FAISS 直接取回數量。
 - `OCR_MODE`：OCR 模式，可為 `auto`、`force` 或 `disabled`。自動模式只會 OCR 文字過少的 PDF 頁面。
 - `OCR_LANG`：PaddleOCR 語言，預設 `ch`。
 - `OCR_MIN_TEXT_CHARS`：自動模式下，單頁文字低於此字元數才執行 OCR。
@@ -159,6 +180,8 @@ python -m pip install paddlepaddle
 ollama pull bge-m3
 ollama pull qwen3:4b
 ```
+
+不需要也不應執行 `ollama pull BAAI/bge-reranker-v2-m3`。Reranker 第一次啟用時會由 FlagEmbedding 自動下載至 Hugging Face 模型快取；下載時間取決於網路，CPU 載入與重排也會增加延遲及記憶體用量。
 
 確認 Ollama 已啟動後執行：
 
@@ -183,11 +206,11 @@ python -m compileall app.py src tests scripts
 ## RAG Retrieval Evaluation
 
 本專案提供一套與 Streamlit UI 完全分離的 Retrieval benchmark，用固定的
-`documents/evaluation/*.pdf` 評估目前 FAISS Vector Similarity Search baseline。固定文件可讓每次調整參數後都使用相同語料，避免上傳內容不同而使實驗結果無法比較；正式問答流程仍只處理使用者在 Streamlit 上傳的 PDF，不會自動載入 benchmark 文件。
+`documents/evaluation/*.pdf` 比較 FAISS Vector Similarity Search baseline 與 Reranker 重排結果。固定文件可讓每次調整參數後都使用相同語料，避免上傳內容不同而使實驗結果無法比較；正式問答流程仍只處理使用者在 Streamlit 上傳的 PDF，不會自動載入 benchmark 文件。
 
 `evaluation/dataset.json` 是 Golden Dataset。每筆資料包含送進 Retriever 的 `question`、正確 Chunk 所屬的 `expected_source`，以及該 Chunk 必須包含的 `expected_text`。只有同一個取回的 Chunk 同時符合來源檔名與關鍵文字才算 Hit。
 
-- **Hit Rate@1、@3、@5、@8、@TOP_K**：依正確 Chunk 最早出現的排名，計算位於各排名門檻內的題數比例；`@TOP_K` 使用 `.env` 設定值，若與固定門檻相同則只顯示一次。
+- **Hit Rate@1、@3、@5、@8、@RETRIEVAL_TOP_K**：依正確 Chunk 最早出現的排名，計算位於各排名門檻內的題數比例；最後一項使用完整 FAISS 候選數量。
 - **MRR**（Mean Reciprocal Rank）：每題第一個正確 Chunk 排名的倒數平均；Rank 1 為 `1`、Rank 2 為 `0.5`，設定的 Top-K 中沒有正確 Chunk 則為 `0`。
 
 Evaluation PDF 不會提交到 Git。第一次執行前，請從專案根目錄下載 NIST 官方文件並驗證 SHA-256：
@@ -214,13 +237,15 @@ python scripts/evaluate_retrieval.py
 
 每次執行時，Script 都會重新載入專案根目錄的 `.env`，顯示本次實際採用的設定，並先驗證 Ollama 連線與 Embedding 模型能否產生向量。環境檢查通過後才會解析 PDF 和建立索引，因此模型名稱錯誤或 Ollama 未啟動時會立即停止並顯示原因。
 
-Script 會沿用正式 RAG 的 PDF parser、Chunking、Ollama Embedding、FAISS 建索引與 `similarity_search()`，但不會呼叫聊天模型。Evaluation 依 `.env` 的 `TOP_K` 取回 Chunk；為了計算固定的 Hit Rate@1、@3、@5、@8，`TOP_K` 必須至少為 8。正式判定仍以 `expected_source` 與 `expected_text` 的嚴格字串比對為準，不會做文字正規化、模糊或語意比對。
+Script 會沿用正式 RAG 的 PDF parser、Chunking、Ollama Embedding、FAISS 建索引與 `similarity_search()`，但不會呼叫聊天模型。每題只執行一次 FAISS 搜尋：原始 `RETRIEVAL_TOP_K` 候選順序計為 Baseline，同一候選集合的完整重排順序計為 Reranked；不會先截斷成正式問答的 `TOP_K`。為了計算固定的 Hit Rate@1、@3、@5、@8，`RETRIEVAL_TOP_K` 必須至少為 8。正式判定仍以 `expected_source` 與 `expected_text` 的嚴格字串比對為準，不會做文字正規化、模糊或語意比對。
+
+輸出分為 `Baseline Retrieval`、`Reranked Retrieval` 與 `Difference`。前兩部分各列 Hit Rate 與 MRR，Difference 列出重排後相對 Baseline 的指標差值。若 `RERANKER_ENABLED=false`，Evaluation 只執行並輸出 Baseline，不建立或驗證 Reranker，也不產生假造的 Reranked 指標。
 
 正式評估前會先確認每題來源 PDF、解析全文中的 `expected_text`，以及來源正確的單一 Chunk 是否完整包含該文字。輸出會列出未通過題號及 `SOURCE_NOT_FOUND`、`EXPECTED_TEXT_NOT_IN_PARSED_PDF`、`EXPECTED_TEXT_NOT_IN_ANY_CHUNK` 等原因；可評估題目若正確 Chunk 未進入 Top-K，會記為 `GOLD_CHUNK_NOT_IN_TOP_K`。摘要包含通過檢查題數、各 MISS 原因、逐題 Result/Rank/Source/MISS Reason、Hit Rate 與以全部題目為分母的 MRR。
 
 Evaluation 專用 FAISS 快取位於 `storage/retrieval_evaluation/<cache-key>/`，包含 `index.faiss`、`documents.json` 與 `manifest.json`。快取鍵由 PDF 檔名與內容 SHA-256，以及 Embedding 模型、Embedding 維度、Chunk Size、Chunk Overlap、切分符號、Metadata/頁碼設定、PDF loader 與相關解析套件版本共同決定；任一項變更都會自動改用新快取並重建。載入時也會驗證檔案雜湊、向量維度及 Chunk 數量，失敗時安全重建。這個磁碟快取只用於 Retrieval Evaluation，不改變 Streamlit 工作階段內索引的既有行為。
 
-未來可用同一組固定 PDF 與 Golden Dataset 比較 Chunk Size、Chunk Overlap、Embedding Model、Hybrid Search 或 Reranker；本版僅實作既有 FAISS Vector Similarity Search baseline。
+Reranker 設定不會加入 FAISS cache key，因為它不改變 PDF、Chunk、Embedding 維度或 FAISS index；切換 Reranker 開關或模型後可繼續使用既有 Evaluation FAISS cache。
 
 ## 測試問題建議
 
@@ -241,6 +266,8 @@ Evaluation 專用 FAISS 快取位於 `storage/retrieval_evaluation/<cache-key>/`
 
 - 無法連線：確認 Ollama 應用程式已啟動，預設服務網址是 `http://localhost:11434`。
 - 找不到模型：重新執行上述兩個 `ollama pull` 指令。
+- Reranker 第一次執行較久：首次使用會從 Hugging Face 下載模型並建立本機快取；後續會重用快取與目前程序中的模型實例。
+- 無法載入 Reranker：確認已安裝 `FlagEmbedding`、網路可連線至 Hugging Face，並確認 `RERANKER_MODEL` 名稱正確。若本機記憶體有限，可在 `.env` 設定 `RERANKER_ENABLED=false` 暫時停用。
 - PDF 沒有文字：確認 `OCR_MODE` 不是 `disabled`，且已安裝 PaddleOCR 與 PaddlePaddle。
 - PDF 解壓縮錯誤：若看到 `Error -3 while decompressing data: invalid code lengths set`，通常代表 PDF 內部壓縮資料不標準或部分損毀。可先確認是否仍能建立知識庫；若無法解析，請用瀏覽器或 PDF 閱讀器開啟後「列印成 PDF」重新輸出一份再上傳。
 - 回答不正確：展開「實際檢索到的原始文字區塊」，先確認檢索結果是否包含答案，再調整 Chunk 或問題用詞。

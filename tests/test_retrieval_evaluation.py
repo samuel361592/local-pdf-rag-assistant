@@ -12,11 +12,13 @@ from langchain_core.documents import Document
 from scripts.evaluate_retrieval import (
     EvaluationSetupError,
     evaluate_questions,
+    evaluate_questions_with_reranker,
     print_precheck_results,
     print_summary,
     validate_evaluation_env_file,
     validate_evaluation_top_k,
     verify_embedding_environment,
+    verify_reranker_environment,
 )
 from src.rag.config import Settings, load_settings
 from src.rag.evaluation import (
@@ -60,8 +62,10 @@ class FakeVectorStore:
     def __init__(self, chunks: list[Document]) -> None:
         self.chunks = chunks
         self.requested_k: int | None = None
+        self.calls = 0
 
     def similarity_search(self, _question: str, k: int) -> list[Document]:
+        self.calls += 1
         self.requested_k = k
         return self.chunks[:k]
 
@@ -72,6 +76,17 @@ class FakeEmbeddings:
 
     def embed_query(self, _text: str) -> list[float]:
         return self.vector
+
+
+class FakeReranker:
+    def __init__(self, scores: list[float] | float) -> None:
+        self.scores = scores
+        self.calls = 0
+
+    def compute_score(self, _pairs: object, normalize: bool) -> list[float] | float:
+        assert normalize
+        self.calls += 1
+        return self.scores
 
 
 def make_passed_check(item: GoldenDatasetItem) -> GoldenDatasetCheckResult:
@@ -347,8 +362,8 @@ def test_embedding_environment_check_reports_model_error() -> None:
 
 
 def test_evaluation_top_k_must_cover_largest_hit_rate_cutoff() -> None:
-    with pytest.raises(EvaluationSetupError, match="TOP_K 必須至少為 8"):
-        validate_evaluation_top_k(Settings(top_k=7))
+    with pytest.raises(EvaluationSetupError, match="RETRIEVAL_TOP_K 必須至少為 8"):
+        validate_evaluation_top_k(Settings(retrieval_top_k=7))
 
 
 @pytest.mark.parametrize(
@@ -405,6 +420,86 @@ def test_question_error_is_classified_and_evaluation_continues(
     assert results[0].miss_reason is MissReason.INTERNAL_EVALUATION_ERROR
 
 
+def test_baseline_and_reranked_use_one_faiss_search_and_improve_mrr(
+    golden_item: GoldenDatasetItem,
+) -> None:
+    chunks = [
+        make_document("irrelevant one", "other.pdf"),
+        make_document("irrelevant two", "other.pdf"),
+        make_document("irrelevant three", "other.pdf"),
+        make_document(golden_item.expected_text, golden_item.expected_source),
+    ]
+    vector_store = FakeVectorStore(chunks)
+    reranker = FakeReranker([0.1, 0.2, 0.3, 0.9])
+
+    comparison = evaluate_questions_with_reranker(
+        vector_store,
+        [golden_item],
+        candidate_k=4,
+        reranker=reranker,
+        checks=[make_passed_check(golden_item)],
+    )
+
+    assert vector_store.calls == 1
+    assert vector_store.requested_k == 4
+    assert reranker.calls == 1
+    assert comparison.baseline[0].rank == 4
+    assert comparison.reranked[0].rank == 1
+    assert comparison.baseline[0].reciprocal_rank == pytest.approx(0.25)
+    assert comparison.reranked[0].reciprocal_rank == pytest.approx(1.0)
+    assert calculate_mrr(comparison.reranked) - calculate_mrr(
+        comparison.baseline
+    ) > 0
+
+
+def test_reranker_cannot_create_gold_chunk_missing_from_candidates(
+    golden_item: GoldenDatasetItem,
+) -> None:
+    vector_store = FakeVectorStore(
+        [
+            make_document("irrelevant one", "other.pdf"),
+            make_document("irrelevant two", "other.pdf"),
+        ]
+    )
+
+    comparison = evaluate_questions_with_reranker(
+        vector_store,
+        [golden_item],
+        candidate_k=2,
+        reranker=FakeReranker([0.1, 0.9]),
+        checks=[make_passed_check(golden_item)],
+    )
+
+    assert not comparison.baseline[0].is_hit
+    assert not comparison.reranked[0].is_hit
+    assert comparison.baseline[0].miss_reason is MissReason.GOLD_CHUNK_NOT_IN_TOP_K
+    assert comparison.reranked[0].miss_reason is MissReason.GOLD_CHUNK_NOT_IN_TOP_K
+
+
+def test_disabled_reranker_environment_check_does_not_call_model() -> None:
+    reranker = FakeReranker(0.9)
+
+    result = verify_reranker_environment(
+        Settings(reranker_enabled=False),
+        reranker=reranker,
+    )
+
+    assert result is None
+    assert reranker.calls == 0
+
+
+def test_reranker_environment_error_is_not_reported_as_embedding_error() -> None:
+    class FailingReranker:
+        def compute_score(self, _pairs: object, normalize: bool) -> float:
+            raise RuntimeError("reranker model failed")
+
+    with pytest.raises(
+        EvaluationSetupError,
+        match="Reranker 環境檢查失敗.*reranker model failed",
+    ):
+        verify_reranker_environment(Settings(), reranker=FailingReranker())
+
+
 def test_precheck_output_includes_question_source_text_and_reason(
     golden_item: GoldenDatasetItem,
     capsys: pytest.CaptureFixture[str],
@@ -441,13 +536,17 @@ def test_summary_prints_hit_rate_at_each_cutoff(
 
     print_summary(
         document_count=2,
-        settings=Settings(top_k=40),
+        settings=Settings(reranker_enabled=False, retrieval_top_k=40),
         results=results,
     )
 
     output = capsys.readouterr().out
-    assert output.count("Top-K:") == 1
-    assert "Top-K: 40" in output
+    assert "FAISS Candidate K: 40" in output
+    assert "Answer Top-K: 4" in output
+    assert "Baseline Retrieval" in output
+    assert "Reranked Retrieval" not in output
+    assert "Difference" not in output
+    assert "Reranker Enabled: NO" in output
     assert "Hit Rate@1: 20.00%" in output
     assert "Hit Rate@3: 40.00%" in output
     assert "Hit Rate@5: 60.00%" in output
@@ -460,6 +559,29 @@ def test_summary_prints_hit_rate_at_each_cutoff(
     assert "Passed Chunk Evaluability Check: 5" in output
     assert "FAISS Cache Used: NO" in output
     assert "INTERNAL_EVALUATION_ERROR: 1" in output
+
+
+def test_summary_compares_baseline_and_reranked_metrics(
+    golden_item: GoldenDatasetItem,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline = [RetrievalEvaluationResult(golden_item, rank=4)]
+    reranked = [RetrievalEvaluationResult(golden_item, rank=1)]
+
+    print_summary(
+        document_count=1,
+        settings=Settings(retrieval_top_k=20, top_k=4),
+        baseline_results=baseline,
+        reranked_results=reranked,
+    )
+
+    output = capsys.readouterr().out
+    assert "Reranked Retrieval" in output
+    assert "Difference" in output
+    assert "Hit Rate@1 Delta: +100.00%" in output
+    assert "MRR Delta: +0.75" in output
+    assert "Reranker Enabled: YES" in output
+    assert "Reranker Model: BAAI/bge-reranker-v2-m3" in output
 
 
 def test_cache_signature_changes_for_pdf_and_index_settings(tmp_path: Path) -> None:
@@ -517,6 +639,33 @@ def test_cache_signature_changes_for_pdf_and_index_settings(tmp_path: Path) -> N
             changed_pdf.cache_key,
         }
     ) == 6
+
+
+def test_cache_signature_ignores_reranker_settings(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "document.pdf"
+    pdf_path.write_bytes(b"same-pdf")
+    enabled = build_evaluation_cache_signature(
+        [pdf_path],
+        Settings(
+            reranker_enabled=True,
+            reranker_model="model-a",
+            retrieval_top_k=20,
+            top_k=4,
+        ),
+        3,
+    )
+    disabled = build_evaluation_cache_signature(
+        [pdf_path],
+        Settings(
+            reranker_enabled=False,
+            reranker_model="model-b",
+            retrieval_top_k=40,
+            top_k=8,
+        ),
+        3,
+    )
+
+    assert enabled.cache_key == disabled.cache_key
 
 
 def test_faiss_cache_round_trip_and_corruption_detection(tmp_path: Path) -> None:

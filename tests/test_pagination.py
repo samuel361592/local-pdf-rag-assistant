@@ -11,6 +11,14 @@ from app import (
     shorten_filename,
 )
 from src.rag.document_loader import PAGE_NUMBER_KEY, SOURCE_FILENAME_KEY
+from src.rag.reranker import (
+    RerankerComputeError,
+    RerankerDependencyError,
+    RerankerDownloadError,
+    RerankerLoadError,
+    RerankerMemoryError,
+    RerankerModelNotFoundError,
+)
 
 
 def test_page_window_returns_only_requested_page() -> None:
@@ -107,6 +115,27 @@ def test_friendly_error_hides_unknown_internal_details() -> None:
     assert "internal stack detail" not in message
     assert "engine.cc" not in message
     assert "未預期錯誤" in message
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_text"),
+    [
+        (RerankerDependencyError("missing"), "FlagEmbedding"),
+        (RerankerDownloadError("connection failed"), "無法下載重排模型"),
+        (RerankerModelNotFoundError("404"), "找不到指定的重排模型"),
+        (RerankerLoadError("load failed"), "無法載入重排模型"),
+        (RerankerComputeError("compute failed"), "重排模型計算失敗"),
+        (RerankerMemoryError("out of memory"), "記憶體不足"),
+    ],
+)
+def test_friendly_error_distinguishes_reranker_failures(
+    error: Exception,
+    expected_text: str,
+) -> None:
+    message = friendly_error(error)
+
+    assert expected_text in message
+    assert "Ollama 模型" not in message
 
 
 def test_ocr_preview_text_key_changes_with_source() -> None:

@@ -20,6 +20,10 @@ class Settings:
     chunk_size: int = 500
     chunk_overlap: int = 80
     top_k: int = 4
+    reranker_enabled: bool = True
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    reranker_use_fp16: bool = False
+    retrieval_top_k: int = 20
     ocr_mode: str = "auto"
     ocr_lang: str = "ch"
     ocr_min_text_chars: int = 30
@@ -36,6 +40,12 @@ class Settings:
             raise ValueError("CHUNK_OVERLAP 必須小於 CHUNK_SIZE。")
         if self.top_k <= 0:
             raise ValueError("TOP_K 必須大於 0。")
+        if self.retrieval_top_k <= 0:
+            raise ValueError("RETRIEVAL_TOP_K 必須大於 0。")
+        if self.retrieval_top_k < self.top_k:
+            raise ValueError("RETRIEVAL_TOP_K 必須大於或等於 TOP_K。")
+        if not self.reranker_model.strip():
+            raise ValueError("RERANKER_MODEL 不可為空白。")
         if self.ocr_mode not in {"auto", "force", "disabled"}:
             raise ValueError("OCR_MODE 必須是 auto、force 或 disabled。")
         if self.ocr_min_text_chars < 0:
@@ -83,6 +93,16 @@ def load_settings(
         chunk_size=_read_int("CHUNK_SIZE", defaults.chunk_size),
         chunk_overlap=_read_int("CHUNK_OVERLAP", defaults.chunk_overlap),
         top_k=_read_int("TOP_K", defaults.top_k),
+        reranker_enabled=_read_bool(
+            "RERANKER_ENABLED", defaults.reranker_enabled
+        ),
+        reranker_model=os.getenv("RERANKER_MODEL", defaults.reranker_model),
+        reranker_use_fp16=_read_bool(
+            "RERANKER_USE_FP16", defaults.reranker_use_fp16
+        ),
+        retrieval_top_k=_read_int(
+            "RETRIEVAL_TOP_K", defaults.retrieval_top_k
+        ),
         ocr_mode=os.getenv("OCR_MODE", defaults.ocr_mode).strip().casefold(),
         ocr_lang=os.getenv("OCR_LANG", defaults.ocr_lang),
         ocr_min_text_chars=_read_int(

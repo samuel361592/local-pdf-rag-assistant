@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import sys
 from collections import Counter
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 from dotenv import dotenv_values
+from langchain_core.documents import Document
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -38,6 +40,7 @@ from src.rag.evaluation_cache import (
     load_evaluation_cache,
     save_evaluation_cache,
 )
+from src.rag.reranker import create_reranker, rerank_documents
 from src.rag.vector_store import (
     create_embeddings,
     create_vector_store,
@@ -61,6 +64,12 @@ MINIMUM_EVALUATION_TOP_K = max(HIT_RATE_CUTOFFS)
 
 class EvaluationSetupError(RuntimeError):
     """代表 benchmark 輸入檔案或目錄設定錯誤。"""
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationComparison:
+    baseline: list[RetrievalEvaluationResult]
+    reranked: list[RetrievalEvaluationResult]
 
 
 class NamedBytesIO(BytesIO):
@@ -94,15 +103,19 @@ def print_environment(settings: Settings) -> None:
     print(f"Environment File: {ENV_PATH}")
     print(f"Ollama Base URL: {settings.ollama_base_url}")
     print(f"Embedding Model: {settings.embedding_model}")
+    print(f"Reranker Enabled: {'YES' if settings.reranker_enabled else 'NO'}")
+    print(f"Reranker Model: {settings.reranker_model}")
+    print(f"FAISS Candidate K: {settings.retrieval_top_k}")
+    print(f"Answer Top-K: {settings.top_k}")
     print(f"Chunk Size: {settings.chunk_size}")
     print(f"Chunk Overlap: {settings.chunk_overlap}")
     print(flush=True)
 
 
 def validate_evaluation_top_k(settings: Settings) -> None:
-    if settings.top_k < MINIMUM_EVALUATION_TOP_K:
+    if settings.retrieval_top_k < MINIMUM_EVALUATION_TOP_K:
         raise EvaluationSetupError(
-            f"TOP_K 必須至少為 {MINIMUM_EVALUATION_TOP_K}，"
+            f"RETRIEVAL_TOP_K 必須至少為 {MINIMUM_EVALUATION_TOP_K}，"
             "才能計算 Hit Rate@1、@3、@5、@8。"
         )
 
@@ -126,6 +139,39 @@ def verify_embedding_environment(
             f"Embedding 模型 {settings.embedding_model} 沒有回傳向量。"
         )
     return client, len(vector)
+
+
+def verify_reranker_environment(
+    settings: Settings,
+    reranker: Any | None = None,
+) -> Any | None:
+    """驗證模型能載入並產生一筆有效分數；停用時完全略過。"""
+
+    if not settings.reranker_enabled:
+        return None
+    try:
+        client = (
+            reranker
+            if reranker is not None
+            else create_reranker(
+                settings.reranker_model,
+                settings.reranker_use_fp16,
+            )
+        )
+        test_document = Document(page_content="retrieval evaluation document")
+        rerank_documents(
+            "retrieval evaluation query",
+            [test_document],
+            client,
+            1,
+        )
+    except Exception as exc:
+        detail = str(exc).strip() or type(exc).__name__
+        raise EvaluationSetupError(
+            "Reranker 環境檢查失敗："
+            f"{settings.reranker_model}；{detail}"
+        ) from exc
+    return client
 
 
 def find_evaluation_pdfs(directory: Path) -> list[Path]:
@@ -212,6 +258,98 @@ def evaluate_questions(
     return results
 
 
+def _classify_result(
+    item: GoldenDatasetItem,
+    chunks: list[Document],
+    check: GoldenDatasetCheckResult | None,
+) -> RetrievalEvaluationResult:
+    strict_result = evaluate_retrieved_chunks(item, chunks)
+    if strict_result.is_hit:
+        return strict_result
+    return RetrievalEvaluationResult(
+        item=item,
+        rank=None,
+        miss_reason=classify_miss_reason(item, chunks, check),
+    )
+
+
+def evaluate_questions_with_reranker(
+    vector_store: object,
+    dataset: list[GoldenDatasetItem],
+    candidate_k: int,
+    reranker: Any,
+    checks: list[GoldenDatasetCheckResult] | None = None,
+) -> EvaluationComparison:
+    """每題只搜尋一次 FAISS，再以同一候選集合比較重排前後結果。"""
+
+    if checks is not None and len(checks) != len(dataset):
+        raise ValueError("Golden Dataset 與前置檢查結果數量不一致。")
+
+    baseline_results: list[RetrievalEvaluationResult] = []
+    reranked_results: list[RetrievalEvaluationResult] = []
+    total_questions = len(dataset)
+    for index, item in enumerate(dataset, start=1):
+        report_progress(f"Evaluating question {index} of {total_questions}.")
+        print(f"Question: {item.question}")
+        check = checks[index - 1] if checks is not None else None
+        try:
+            candidates = similarity_search(vector_store, item.question, candidate_k)
+            baseline_result = _classify_result(item, candidates, check)
+        except Exception as exc:
+            baseline_result = RetrievalEvaluationResult(
+                item=item,
+                rank=None,
+                miss_reason=MissReason.INTERNAL_EVALUATION_ERROR,
+            )
+            reranked_result = baseline_result
+            detail = str(exc).strip() or type(exc).__name__
+            print(f"Internal Error: {detail}")
+        else:
+            try:
+                reranked_chunks = rerank_documents(
+                    item.question,
+                    candidates,
+                    reranker,
+                    candidate_k,
+                )
+                reranked_result = _classify_result(
+                    item, reranked_chunks, check
+                )
+            except Exception as exc:
+                reranked_result = RetrievalEvaluationResult(
+                    item=item,
+                    rank=None,
+                    miss_reason=MissReason.INTERNAL_EVALUATION_ERROR,
+                )
+                detail = str(exc).strip() or type(exc).__name__
+                print(f"Reranker Internal Error: {detail}")
+
+        baseline_results.append(baseline_result)
+        reranked_results.append(reranked_result)
+        for label, result in (
+            ("Baseline", baseline_result),
+            ("Reranked", reranked_result),
+        ):
+            print(f"{label} Result: {'HIT' if result.is_hit else 'MISS'}")
+            print(
+                f"{label} Rank: "
+                f"{result.rank if result.rank is not None else 'N/A'}"
+            )
+            print(
+                f"{label} MISS Reason: "
+                f"{result.miss_reason.value if result.miss_reason else 'N/A'}"
+            )
+        print(f"Source: {item.expected_source}")
+        if not baseline_result.is_hit or not reranked_result.is_hit:
+            print(f"Expected Text: {item.expected_text}")
+        print(flush=True)
+
+    return EvaluationComparison(
+        baseline=baseline_results,
+        reranked=reranked_results,
+    )
+
+
 def print_precheck_results(checks: list[GoldenDatasetCheckResult]) -> None:
     print("Golden Dataset Precheck:")
     full_text_failures = [
@@ -250,27 +388,28 @@ def print_summary(
     *,
     document_count: int,
     settings: Settings,
-    results: list[RetrievalEvaluationResult],
+    results: list[RetrievalEvaluationResult] | None = None,
+    baseline_results: list[RetrievalEvaluationResult] | None = None,
+    reranked_results: list[RetrievalEvaluationResult] | None = None,
     checks: list[GoldenDatasetCheckResult] | None = None,
     cache_used: bool = False,
     cache_directory: Path | None = None,
 ) -> None:
-    mrr = calculate_mrr(results)
-    report_cutoffs = sorted({*HIT_RATE_CUTOFFS, settings.top_k})
+    baseline = baseline_results if baseline_results is not None else results
+    if baseline is None:
+        raise ValueError("必須提供 Baseline Retrieval 結果。")
+    if reranked_results is not None and len(reranked_results) != len(baseline):
+        raise ValueError("Baseline 與 Reranked 結果數量不一致。")
+    report_cutoffs = sorted({*HIT_RATE_CUTOFFS, settings.retrieval_top_k})
     passed_full_text_count = (
         sum(check.passed_full_text_check for check in checks)
         if checks is not None
-        else len(results)
+        else len(baseline)
     )
     passed_chunk_count = (
         sum(check.passed_chunk_check for check in checks)
         if checks is not None
-        else len(results)
-    )
-    miss_reason_counts = Counter(
-        result.miss_reason or MissReason.INTERNAL_EVALUATION_ERROR
-        for result in results
-        if not result.is_hit
+        else len(baseline)
     )
 
     print("================================")
@@ -278,39 +417,85 @@ def print_summary(
     print("================================")
     print()
     print(f"Documents: {document_count}")
-    print(f"Questions: {len(results)}")
-    print(f"Golden Dataset Questions: {len(results)}")
+    print(f"Questions: {len(baseline)}")
+    print(f"Golden Dataset Questions: {len(baseline)}")
     print(f"Passed Parsed PDF Check: {passed_full_text_count}")
     print(f"Passed Chunk Evaluability Check: {passed_chunk_count}")
-    print(f"Top-K: {settings.top_k}")
+    print(f"Embedding Model: {settings.embedding_model}")
+    print(f"Reranker Enabled: {'YES' if settings.reranker_enabled else 'NO'}")
+    print(f"Reranker Model: {settings.reranker_model}")
+    print(f"FAISS Candidate K: {settings.retrieval_top_k}")
+    print(f"Answer Top-K: {settings.top_k}")
     print(f"FAISS Cache Used: {'YES' if cache_used else 'NO'}")
     print(f"FAISS Cache Status: {'LOADED' if cache_used else 'REBUILT'}")
     if cache_directory is not None:
         print(f"FAISS Cache Directory: {cache_directory}")
-    print()
-    for cutoff in report_cutoffs:
-        hit_rate = calculate_hit_rate_at_k(results, cutoff)
-        print(f"Hit Rate@{cutoff}: {hit_rate:.2%}")
-    print(f"MRR: {mrr:.2f}")
-    print()
-    print("MISS Reasons:")
-    for reason in MissReason:
-        print(f"{reason.value}: {miss_reason_counts[reason]}")
-    print()
-    print(f"Embedding Model: {settings.embedding_model}")
     print(f"Chunk Size: {settings.chunk_size}")
     print(f"Chunk Overlap: {settings.chunk_overlap}")
+
+    def print_metrics(
+        heading: str,
+        section_results: list[RetrievalEvaluationResult],
+    ) -> None:
+        print()
+        print(heading)
+        for cutoff in report_cutoffs:
+            hit_rate = calculate_hit_rate_at_k(section_results, cutoff)
+            print(f"Hit Rate@{cutoff}: {hit_rate:.2%}")
+        print(f"MRR: {calculate_mrr(section_results):.2f}")
+        miss_reason_counts = Counter(
+            result.miss_reason or MissReason.INTERNAL_EVALUATION_ERROR
+            for result in section_results
+            if not result.is_hit
+        )
+        print("MISS Reasons:")
+        for reason in MissReason:
+            print(f"{reason.value}: {miss_reason_counts[reason]}")
+
+    print_metrics("Baseline Retrieval", baseline)
+    if reranked_results is not None:
+        print_metrics("Reranked Retrieval", reranked_results)
+        print()
+        print("Difference")
+        for cutoff in HIT_RATE_CUTOFFS:
+            delta = calculate_hit_rate_at_k(
+                reranked_results, cutoff
+            ) - calculate_hit_rate_at_k(baseline, cutoff)
+            print(f"Hit Rate@{cutoff} Delta: {delta:+.2%}")
+        mrr_delta = calculate_mrr(reranked_results) - calculate_mrr(baseline)
+        print(f"MRR Delta: {mrr_delta:+.2f}")
+
     print()
     print("Question Results:")
-    for number, result in enumerate(results, start=1):
+    for number, baseline_result in enumerate(baseline, start=1):
         print(f"Question Number: {number}")
-        print(f"Result: {'HIT' if result.is_hit else 'MISS'}")
-        print(f"Rank: {result.rank if result.rank is not None else 'N/A'}")
-        print(f"Source: {result.item.expected_source}")
         print(
-            "MISS Reason: "
-            f"{result.miss_reason.value if result.miss_reason else 'N/A'}"
+            "Baseline Result: "
+            f"{'HIT' if baseline_result.is_hit else 'MISS'}"
         )
+        print(
+            "Baseline Rank: "
+            f"{baseline_result.rank if baseline_result.rank is not None else 'N/A'}"
+        )
+        print(
+            "Baseline MISS Reason: "
+            f"{baseline_result.miss_reason.value if baseline_result.miss_reason else 'N/A'}"
+        )
+        if reranked_results is not None:
+            reranked_result = reranked_results[number - 1]
+            print(
+                "Reranked Result: "
+                f"{'HIT' if reranked_result.is_hit else 'MISS'}"
+            )
+            print(
+                "Reranked Rank: "
+                f"{reranked_result.rank if reranked_result.rank is not None else 'N/A'}"
+            )
+            print(
+                "Reranked MISS Reason: "
+                f"{reranked_result.miss_reason.value if reranked_result.miss_reason else 'N/A'}"
+            )
+        print(f"Source: {baseline_result.item.expected_source}")
 
 
 def run_evaluation() -> None:
@@ -328,6 +513,12 @@ def run_evaluation() -> None:
     report_progress(
         f"Embedding environment is ready with {vector_dimensions} dimensions."
     )
+
+    reranker = None
+    if settings.reranker_enabled:
+        report_progress("Checking FlagEmbedding and the Reranker model.")
+        reranker = verify_reranker_environment(settings)
+        report_progress("Reranker environment is ready.")
 
     report_progress("Scanning the evaluation PDF directory.")
     pdf_paths = find_evaluation_pdfs(EVALUATION_DOCUMENTS_DIR)
@@ -411,17 +602,30 @@ def run_evaluation() -> None:
             report_progress(f"Saved FAISS index cache: {saved_cache_dir}")
 
     report_progress("Starting question evaluation.")
-    results = evaluate_questions(
-        vector_store,
-        dataset,
-        settings.top_k,
-        checks,
-    )
+    if settings.reranker_enabled:
+        comparison = evaluate_questions_with_reranker(
+            vector_store,
+            dataset,
+            settings.retrieval_top_k,
+            reranker,
+            checks,
+        )
+        baseline_results = comparison.baseline
+        reranked_results = comparison.reranked
+    else:
+        baseline_results = evaluate_questions(
+            vector_store,
+            dataset,
+            settings.retrieval_top_k,
+            checks,
+        )
+        reranked_results = None
     report_progress("Calculating final metrics.")
     print_summary(
         document_count=batch.document_count,
         settings=settings,
-        results=results,
+        baseline_results=baseline_results,
+        reranked_results=reranked_results,
         checks=checks,
         cache_used=cache_used,
         cache_directory=cache_dir,

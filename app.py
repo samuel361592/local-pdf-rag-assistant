@@ -30,6 +30,14 @@ from src.rag.rag_service import (
     RagResult,
     RagService,
 )
+from src.rag.reranker import (
+    RerankerComputeError,
+    RerankerDependencyError,
+    RerankerDownloadError,
+    RerankerLoadError,
+    RerankerMemoryError,
+    RerankerModelNotFoundError,
+)
 from src.rag.vector_store import create_vector_store
 
 
@@ -142,6 +150,18 @@ def friendly_error(error: Exception) -> str:
     lowered = message.lower()
     if isinstance(error, PDFProcessingError):
         return message
+    if isinstance(error, RerankerDependencyError):
+        return "未安裝 FlagEmbedding。請先執行 pip install -r requirements.txt。"
+    if isinstance(error, RerankerMemoryError):
+        return "載入或執行重排模型時記憶體不足。請關閉其他程式後再試，或停用 Reranker。"
+    if isinstance(error, RerankerDownloadError):
+        return "無法下載重排模型。請檢查網路連線、Hugging Face 存取狀態或本機模型快取。"
+    if isinstance(error, RerankerModelNotFoundError):
+        return "找不到指定的重排模型。請確認 RERANKER_MODEL 名稱與 Hugging Face 存取權限。"
+    if isinstance(error, RerankerLoadError):
+        return "無法載入重排模型。請確認已安裝 FlagEmbedding，並檢查網路連線或模型快取。"
+    if isinstance(error, RerankerComputeError):
+        return "重排模型計算失敗。請檢查模型快取與可用記憶體後再試。"
     if "paddleocr" in lowered or "paddlepaddle" in lowered:
         return "需要 OCR 時找不到 PaddleOCR 或 PaddlePaddle。請先安裝 OCR 相依套件。"
     if "ocr" in lowered:

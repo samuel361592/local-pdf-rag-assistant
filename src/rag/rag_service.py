@@ -12,6 +12,7 @@ from langchain_ollama import ChatOllama
 from .config import Settings
 from .document_loader import PAGE_NUMBER_KEY, SOURCE_FILENAME_KEY
 from .prompt import INSUFFICIENT_INFORMATION_MESSAGE, SYSTEM_PROMPT, build_user_prompt
+from .reranker import create_reranker, rerank_documents
 from .vector_store import similarity_search
 
 
@@ -38,6 +39,7 @@ class RagProgressEvent:
 
 ProgressCallback = Callable[[RagProgressEvent], None]
 TokenCallback = Callable[[str], None]
+CancellationCallback = Callable[[], None]
 
 
 class RagAnswerCancelled(Exception):
@@ -113,14 +115,83 @@ class RagService:
         vector_store: Any,
         settings: Settings,
         chat_model: Any | None = None,
+        reranker: Any | None = None,
     ) -> None:
         self.vector_store = vector_store
         self.settings = settings
+        self.reranker = reranker
         self.chat_model = chat_model or ChatOllama(
             model=settings.chat_model,
             base_url=settings.ollama_base_url,
             temperature=0,
         )
+
+    def _retrieve_chunks(
+        self,
+        question: str,
+        progress_callback: ProgressCallback | None = None,
+        cancellation_callback: CancellationCallback | None = None,
+    ) -> list[Document]:
+        """執行一次 FAISS 搜尋，並視設定套用第二階段重排。"""
+
+        def check_cancelled() -> None:
+            if cancellation_callback is not None:
+                cancellation_callback()
+
+        candidate_k = (
+            self.settings.retrieval_top_k
+            if self.settings.reranker_enabled
+            else self.settings.top_k
+        )
+        check_cancelled()
+        _emit_progress(
+            progress_callback,
+            "retrieve",
+            f"正在使用 FAISS 檢索前 {candidate_k} 個候選文字區塊。",
+        )
+        candidates = similarity_search(self.vector_store, question, candidate_k)
+        check_cancelled()
+        _emit_progress(
+            progress_callback,
+            "retrieved",
+            f"已找到 {len(candidates)} 個候選文字區塊。",
+        )
+        if not candidates or not self.settings.reranker_enabled:
+            return candidates
+
+        check_cancelled()
+        _emit_progress(
+            progress_callback,
+            "rerank",
+            f"正在使用 {self.settings.reranker_model} 重新排序。",
+        )
+        if self.reranker is None:
+            self.reranker = create_reranker(
+                self.settings.reranker_model,
+                self.settings.reranker_use_fp16,
+            )
+        chunks = rerank_documents(
+            question,
+            candidates,
+            self.reranker,
+            self.settings.top_k,
+        )
+        check_cancelled()
+        sources = [
+            _source_details(chunk, number)
+            for number, chunk in enumerate(chunks, start=1)
+        ]
+        detail = "\n".join(
+            f"[來源 {source.number}] {source.filename}，第 {source.page_number} 頁"
+            for source in sources
+        )
+        _emit_progress(
+            progress_callback,
+            "reranked",
+            f"重排完成，選出前 {len(chunks)} 個文字區塊。",
+            detail,
+        )
+        return chunks
 
     def answer(
         self,
@@ -132,12 +203,7 @@ class RagService:
             raise ValueError("請先輸入問題。")
 
         _emit_progress(progress_callback, "received", "已收到問題。", clean_question)
-        _emit_progress(
-            progress_callback,
-            "retrieve",
-            f"正在檢索最相關的 {self.settings.top_k} 個文字區塊。",
-        )
-        chunks = similarity_search(self.vector_store, clean_question, self.settings.top_k)
+        chunks = self._retrieve_chunks(clean_question, progress_callback)
         if not chunks:
             _emit_progress(
                 progress_callback,
@@ -146,28 +212,12 @@ class RagService:
             )
             return RagResult(INSUFFICIENT_INFORMATION_MESSAGE, [], [])
 
-        retrieved_sources = [
-            _source_details(chunk, number)
-            for number, chunk in enumerate(chunks, start=1)
-        ]
-        retrieved_detail = "\n".join(
-            f"[來源 {source.number}] {source.filename}，第 {source.page_number} 頁"
-            for source in retrieved_sources
-        )
-        _emit_progress(
-            progress_callback,
-            "retrieved",
-            f"已找到 {len(chunks)} 個相關文字區塊。",
-            retrieved_detail,
-        )
-
-        context, sources = format_context(chunks)
         _emit_progress(
             progress_callback,
             "context",
             "正在組合帶來源編號的 Context。",
-            f"Context 長度約 {len(context):,} 個字元。",
         )
+        context, sources = format_context(chunks)
         _emit_progress(
             progress_callback,
             "generate",
@@ -212,13 +262,11 @@ class RagService:
 
         raise_if_cancelled()
         _emit_progress(progress_callback, "received", "已收到問題。", clean_question)
-        _emit_progress(
+        chunks = self._retrieve_chunks(
+            clean_question,
             progress_callback,
-            "retrieve",
-            f"正在檢索最相關的 {self.settings.top_k} 個文字區塊。",
+            raise_if_cancelled,
         )
-        chunks = similarity_search(self.vector_store, clean_question, self.settings.top_k)
-        raise_if_cancelled()
         if not chunks:
             _emit_progress(
                 progress_callback,
@@ -227,29 +275,14 @@ class RagService:
             )
             return RagResult(INSUFFICIENT_INFORMATION_MESSAGE, [], [])
 
-        retrieved_sources = [
-            _source_details(chunk, number)
-            for number, chunk in enumerate(chunks, start=1)
-        ]
-        retrieved_detail = "\n".join(
-            f"[來源 {source.number}] {source.filename}，第 {source.page_number} 頁"
-            for source in retrieved_sources
-        )
-        _emit_progress(
-            progress_callback,
-            "retrieved",
-            f"已找到 {len(chunks)} 個相關文字區塊。",
-            retrieved_detail,
-        )
-
-        context, sources = format_context(chunks)
         raise_if_cancelled()
         _emit_progress(
             progress_callback,
             "context",
             "正在組合帶來源編號的 Context。",
-            f"Context 長度約 {len(context):,} 個字元。",
         )
+        context, sources = format_context(chunks)
+        raise_if_cancelled()
         _emit_progress(
             progress_callback,
             "generate",

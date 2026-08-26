@@ -66,7 +66,11 @@ def test_context_contains_source_number_filename_and_page() -> None:
 
 
 def test_no_results_returns_fixed_insufficient_information_message() -> None:
-    service = RagService(EmptyVectorStore(), Settings(), chat_model=FailingChatModel())
+    service = RagService(
+        EmptyVectorStore(),
+        Settings(reranker_enabled=False),
+        chat_model=FailingChatModel(),
+    )
 
     result = service.answer("文件有說明採購哪個產品嗎？")
 
@@ -76,19 +80,28 @@ def test_no_results_returns_fixed_insufficient_information_message() -> None:
 
 
 def test_answer_reports_progress_events_when_no_results() -> None:
-    service = RagService(EmptyVectorStore(), Settings(), chat_model=FailingChatModel())
+    service = RagService(
+        EmptyVectorStore(),
+        Settings(reranker_enabled=False),
+        chat_model=FailingChatModel(),
+    )
     events: list[RagProgressEvent] = []
 
     service.answer("文件有說明採購哪個產品嗎？", progress_callback=events.append)
 
-    assert [event.stage for event in events] == ["received", "retrieve", "no_results"]
+    assert [event.stage for event in events] == [
+        "received",
+        "retrieve",
+        "retrieved",
+        "no_results",
+    ]
 
 
 def test_stream_answer_preserves_spaces_between_chunks() -> None:
     vector_store = SingleDocumentVectorStore()
     service = RagService(
         vector_store,
-        Settings(),
+        Settings(reranker_enabled=False),
         chat_model=StreamingChatModel(["第一段", " 第二段", "。"]),
     )
     tokens: list[str] = []
@@ -110,7 +123,7 @@ def test_stream_answer_can_cancel_and_keep_partial_result() -> None:
     tokens: list[str] = []
     service = RagService(
         SingleDocumentVectorStore(),
-        Settings(),
+        Settings(reranker_enabled=False),
         chat_model=StreamingChatModel(["保留這段", " 不應處理這段"]),
     )
 
@@ -138,7 +151,7 @@ def test_stream_answer_cancelled_before_retrieval_does_not_query_vector_store() 
     cancel_event.set()
     service = RagService(
         vector_store,
-        Settings(),
+        Settings(reranker_enabled=False),
         chat_model=StreamingChatModel([]),
     )
 
