@@ -1,4 +1,4 @@
-# 本機 PDF RAG 問答助手
+# 本機 RAG 問答助手
 
 這是一個使用 Streamlit、Ollama 與 FAISS 製作的基礎 RAG 學習專案。使用者可上傳一份或多份公開 PDF，系統會從文件擷取文字、建立向量索引，再依檢索內容回答問題並標示來源檔名與頁碼。介面也提供 Chunk 預覽與問答即時流程，方便檢查系統實際檢索與回答的過程。
 
@@ -53,7 +53,7 @@ qwen3:4b 根據 Context 產生回答
 ## 專案結構
 
 ```text
-local-pdf-rag-assistant/
+local-rag-assistant/
 ├── app.py
 ├── scripts/
 │   ├── download_evaluation_pdfs.ps1

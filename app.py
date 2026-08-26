@@ -1,4 +1,4 @@
-"""本機 PDF RAG 問答助手的 Streamlit 入口。"""
+"""本機 RAG 問答助手的 Streamlit 入口。"""
 
 from __future__ import annotations
 
@@ -471,7 +471,9 @@ def render_question_interface(settings: Settings) -> None:
             if not question.strip():
                 st.warning("沒有輸入問題，請先輸入想查詢的內容。")
             elif "vector_store" not in st.session_state:
-                st.warning("尚未建立知識庫，請先上傳 PDF 並按下「建立知識庫」。")
+                st.warning(
+                    "尚未建立知識庫，請先上傳 PDF 或圖片文件並按下「建立知識庫」。"
+                )
             else:
                 st.session_state["rag_job"] = start_rag_job(
                     question,
@@ -524,9 +526,12 @@ def render_question_interface(settings: Settings) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="本機 PDF RAG 問答助手", page_icon="📚", layout="wide")
-    st.title("本機 PDF RAG 問答助手")
-    st.write("上傳公開 PDF，建立暫存於本次工作階段的知識庫，並依文件內容進行問答。")
+    st.set_page_config(page_title="本機 RAG 問答助手", page_icon="📚", layout="wide")
+    st.title("本機 RAG 問答助手")
+    st.write(
+        "上傳公開的 PDF 或圖片文件，建立暫存於本次工作階段的知識庫，"
+        "並依文件內容進行問答。"
+    )
     st.caption("本工具僅供資訊整理與學習，不構成法律或合規建議。")
 
     try:
@@ -537,7 +542,7 @@ def main() -> None:
     settings = render_ocr_controls(settings)
 
     uploaded_files = st.file_uploader(
-        "上傳一份或多份 PDF / PNG / JPG",
+        "上傳一份或多份 PDF 或圖片文件（PNG / JPG）",
         type=["pdf", "png", "jpg", "jpeg"],
         accept_multiple_files=True,
     )
@@ -549,10 +554,12 @@ def main() -> None:
         disabled=is_job_active(current_job),
     ):
         if not uploaded_files:
-            st.warning("尚未上傳 PDF，請先選擇至少一份檔案。")
+            st.warning("尚未上傳 PDF 或圖片文件，請先選擇至少一份檔案。")
         else:
             try:
-                with st.spinner("正在解析 PDF、切分文字並建立向量索引……"):
+                with st.spinner(
+                    "正在解析 PDF 或圖片文件、切分文字並建立向量索引……"
+                ):
                     batch = process_uploaded_pdfs(uploaded_files, settings)
                     vector_store = create_vector_store(batch.chunks, settings)
                 st.session_state["vector_store"] = vector_store

@@ -1,4 +1,4 @@
-"""AI 治理文件 RAG 核心套件。"""
+"""PDF 或圖片文件 RAG 核心套件。"""
 
 from .config import Settings, load_settings
 
