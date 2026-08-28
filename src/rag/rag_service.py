@@ -10,7 +10,12 @@ from langchain_core.documents import Document
 from langchain_ollama import ChatOllama
 
 from .config import Settings
-from .document_loader import PAGE_NUMBER_KEY, SOURCE_FILENAME_KEY
+from .document_loader import (
+    CONTENT_TYPE_KEY,
+    PAGE_NUMBER_KEY,
+    SOURCE_FILENAME_KEY,
+    VISUAL_CONTENT_TYPE,
+)
 from .prompt import INSUFFICIENT_INFORMATION_MESSAGE, SYSTEM_PROMPT, build_user_prompt
 from .reranker import create_reranker, rerank_documents
 from .vector_store import similarity_search
@@ -21,6 +26,19 @@ class SourceReference:
     number: int
     filename: str
     page_number: int | str
+    content_type: str = "text"
+
+    @property
+    def content_type_label(self) -> str:
+        return "視覺分析" if self.content_type == VISUAL_CONTENT_TYPE else "文件文字"
+
+    @property
+    def context_content_type_label(self) -> str:
+        return (
+            "VLM 視覺分析"
+            if self.content_type == VISUAL_CONTENT_TYPE
+            else "文件文字"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +75,8 @@ def _source_details(document: Document, number: int) -> SourceReference:
         or "未知檔案"
     )
     page_number = document.metadata.get(PAGE_NUMBER_KEY, "未知")
-    return SourceReference(number, filename, page_number)
+    content_type = str(document.metadata.get(CONTENT_TYPE_KEY, "text"))
+    return SourceReference(number, filename, page_number, content_type)
 
 
 def format_context(documents: Sequence[Document]) -> tuple[str, list[SourceReference]]:
@@ -70,6 +89,7 @@ def format_context(documents: Sequence[Document]) -> tuple[str, list[SourceRefer
             f"[來源 {number}]\n"
             f"檔名：{source.filename}\n"
             f"頁碼：{source.page_number}\n"
+            f"內容類型：{source.context_content_type_label}\n"
             f"內容：{document.page_content.strip()}"
         )
     return "\n\n---\n\n".join(sections), sources
@@ -182,7 +202,8 @@ class RagService:
             for number, chunk in enumerate(chunks, start=1)
         ]
         detail = "\n".join(
-            f"[來源 {source.number}] {source.filename}，第 {source.page_number} 頁"
+            f"[來源 {source.number}｜{source.content_type_label}] "
+            f"{source.filename}，第 {source.page_number} 頁"
             for source in sources
         )
         _emit_progress(

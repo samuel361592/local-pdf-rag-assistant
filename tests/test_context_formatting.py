@@ -65,6 +65,22 @@ def test_context_contains_source_number_filename_and_page() -> None:
     assert sources[0].filename == "參考指引.pdf"
 
 
+def test_context_and_source_mark_visual_content_type() -> None:
+    document = Document(
+        page_content="[可見異常]\n- 齒輪邊緣疑似缺損。",
+        metadata={
+            "source_filename": "維修手冊.pdf",
+            "page_number": 3,
+            "content_type": "visual",
+        },
+    )
+
+    context, sources = format_context([document])
+
+    assert "內容類型：VLM 視覺分析" in context
+    assert sources[0].content_type_label == "視覺分析"
+
+
 def test_no_results_returns_fixed_insufficient_information_message() -> None:
     service = RagService(
         EmptyVectorStore(),

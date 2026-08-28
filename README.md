@@ -1,6 +1,6 @@
 # 本機 RAG 問答助手
 
-這是一個使用 Streamlit、Ollama 與 FAISS 製作的基礎 RAG 學習專案。使用者可上傳一份或多份公開 PDF，系統會從文件擷取文字、建立向量索引，再依檢索內容回答問題並標示來源檔名與頁碼。介面也提供 Chunk 預覽與問答即時流程，方便檢查系統實際檢索與回答的過程。
+這是一個使用 Streamlit、Ollama 與 FAISS 製作的本機 RAG 學習專案。使用者可上傳一份或多份 PDF／PNG／JPG；系統會保留原生文字與 OCR，並可選擇使用 VLM 建立獨立的視覺描述 Chunk，再依檢索內容回答問題並標示來源檔名、頁碼與內容類型。
 
 > 本專案僅供學習與資訊整理，不構成法律或合規建議。請勿上傳機密、個人資料或其他不應交由本機模型處理的內容。
 
@@ -18,6 +18,8 @@
 - FlagEmbedding：載入 Hugging Face Reranker 並計算 query/document 相關性分數。
 - BAAI/bge-reranker-v2-m3：第二階段重排模型，將 FAISS 候選 Chunk 重新評分與排序。
 - qwen3:4b：聊天模型，負責根據檢索到的文件內容產生繁體中文回答。
+- qwen3-vl:4b：預設 VLM，在建庫階段理解圖片、表格、圖表與可見異常，輸出結構化繁體中文描述。
+- Pydantic：驗證 VLM 的 JSON Schema 輸出。
 - FAISS：向量資料庫，用於儲存文字向量並執行相似度搜尋。
 - python-dotenv：讀取 `.env` 設定檔。
 - pytest：撰寫與執行單元測試。
@@ -26,10 +28,10 @@
 
 ```text
 PDF / PNG / JPG 上傳
+  ├─ PyPDFLoader／PaddleOCR → Text Chunks
+  └─ 頁面圖片／上傳圖片 → qwen3-vl:4b → Visual Chunks
   ↓
-PyPDFLoader 解析 PDF 文字；必要時用 PaddleOCR 補掃描頁或圖片文字
-  ↓
-RecursiveCharacterTextSplitter 切分 Chunk
+RecursiveCharacterTextSplitter 分別切分 Text／Visual Chunk
   ↓
 bge-m3 產生 Embedding
   ↓
@@ -47,13 +49,13 @@ qwen3:4b 根據 Context 產生回答
 ```
 
 1. 使用 `PyPDFLoader` 解析上傳的 PDF；圖片檔或文字過少的 PDF 頁面會交給 OCR。
-2. 保留原始檔名、頁碼與解析方式，再依中文標點切分文字。
-3. 透過 Ollama 的 `bge-m3` 產生 Embedding。
-4. 將向量存入本次 Streamlit Session State 內的 FAISS 索引。
-5. 問答時先由 FAISS 取回 `RETRIEVAL_TOP_K` 個候選 Chunk。
-6. 啟用 Reranker 時，以 `BAAI/bge-reranker-v2-m3` 重排候選，僅取前 `TOP_K` 個組成帶來源編號的 Context；停用時則維持直接取 FAISS 前 `TOP_K` 個的既有流程。
-7. 由 Ollama 的 `qwen3:4b` 僅根據重排後的 Context 產生繁體中文回答。
-8. 送出問題後，介面右側會顯示 Retrieval、Rerank、Context 組合、模型產生與完成狀態。
+2. 啟用 VLM 時，`auto` 模式分析直接上傳圖片、需 OCR 的 PDF 頁與含內嵌圖片的 PDF 頁；`all` 模式分析全部頁面。同頁 OCR 與 VLM 共用一次 PDF 渲染。
+3. VLM 結果會先通過 Pydantic Schema 驗證，並建立獨立 Visual Chunk；單頁失敗時保留可用的原生文字／OCR Chunk。
+4. 保留原始檔名、頁碼、內容類型與解析方式，再依中文標點切分內容。
+5. 透過 Ollama 的 `bge-m3` 為兩種 Chunk 產生 Embedding，並放入同一個 FAISS 索引。
+6. 問答時先由 FAISS 取回 `RETRIEVAL_TOP_K` 個候選 Chunk。
+7. 啟用 Reranker 時，以 `BAAI/bge-reranker-v2-m3` 重排候選，僅取前 `TOP_K` 個組成帶來源編號的 Context。
+8. 由 Ollama 的 `qwen3:4b` 僅根據 Context 產生繁體中文回答；來源會區分「文件文字」與「視覺分析」。
 
 Embedding 與 Reranker 的用途不同：Embedding 將問題與 Chunk 轉成向量，讓 FAISS 快速找出候選集合；Reranker 直接比較問題與候選文字，進行較精細但較耗時的第二階段排序。Reranker 由 Python 的 FlagEmbedding 載入 Hugging Face 模型，不透過 Ollama。
 
@@ -72,6 +74,9 @@ local-rag-assistant/
 ├── src/rag/
 │   ├── config.py
 │   ├── document_loader.py
+│   ├── image_renderer.py
+│   ├── visual_prompt.py
+│   ├── vlm_service.py
 │   ├── evaluation.py
 │   ├── evaluation_cache.py
 │   ├── reranker.py
@@ -93,8 +98,11 @@ local-rag-assistant/
 
 - `app.py`：Streamlit 入口，負責畫面呈現、上傳流程、知識庫建立、問答操作與結果顯示。
 - `src/rag/config.py`：讀取 `.env` 與環境變數，集中管理 Ollama、模型、Chunk 與檢索參數。
-- `src/rag/document_loader.py`：處理 PDF/圖片上傳內容、決定一般解析或 OCR、整理來源檔名與頁碼，並切分 Chunks。
-- `src/rag/ocr_service.py`：使用 PyMuPDF 將 PDF 頁面轉成圖片，並用 PaddleOCR 辨識文字。
+- `src/rag/document_loader.py`：協調 PDF／圖片的原生文字、OCR 與 VLM 處理，建立 Text／Visual Chunks。
+- `src/rag/image_renderer.py`：共用 PDF 頁面渲染、EXIF 方向修正、色彩轉換與等比例縮圖。
+- `src/rag/ocr_service.py`：使用 PaddleOCR 辨識 PDF 頁面與圖片文字。
+- `src/rag/visual_prompt.py`：集中管理具防 Prompt Injection 規則的 VLM Prompt 與版本。
+- `src/rag/vlm_service.py`：呼叫 Ollama VLM、驗證結構化輸出並格式化視覺描述。
 - `src/rag/evaluation.py`：驗證 Golden Dataset、判定 Retrieval Hit，並計算 Hit Rate@1、@3、@5、@8 與 MRR。
 - `src/rag/vector_store.py`：建立 Ollama Embedding client，將 Chunks 寫入 FAISS，並提供相似度搜尋。
 - `src/rag/reranker.py`：延遲載入並快取 FlagEmbedding Reranker，負責第二階段評分與穩定排序。
@@ -132,6 +140,12 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
+若要使用視覺分析，需另外下載 VLM：
+
+```powershell
+ollama pull qwen3-vl:4b
+```
+
 可調整的環境參數：
 
 ```env
@@ -150,6 +164,12 @@ OCR_LANG=ch
 OCR_MIN_TEXT_CHARS=30
 OCR_DPI=300
 OCR_ENABLE_IMAGES=true
+VLM_ENABLED=false
+VLM_MODEL=qwen3-vl:4b
+VLM_MODE=auto
+VLM_MAX_IMAGE_EDGE=1600
+VLM_TIMEOUT_SECONDS=120
+VLM_NUM_PREDICT=800
 ```
 
 - `OLLAMA_BASE_URL`：Ollama 服務網址，預設為本機服務。
@@ -167,6 +187,14 @@ OCR_ENABLE_IMAGES=true
 - `OCR_MIN_TEXT_CHARS`：自動模式下，單頁文字低於此字元數才執行 OCR。
 - `OCR_DPI`：PDF 頁面轉圖片時使用的解析度。
 - `OCR_ENABLE_IMAGES`：是否允許直接上傳 PNG/JPG 圖片做 OCR。
+- `VLM_ENABLED`：是否啟用建庫階段的視覺分析；安全預設為 `false`。
+- `VLM_MODEL`：Ollama VLM 名稱，預設 `qwen3-vl:4b`。
+- `VLM_MODE`：`auto`、`all` 或 `disabled`。向量繪製的 PDF 圖表可能無法被 `auto` 偵測，此時請改用 `all`。
+- `VLM_MAX_IMAGE_EDGE`：送入 VLM 前的圖片最長邊像素上限，不會放大原圖。
+- `VLM_TIMEOUT_SECONDS`：單張圖片模型呼叫逾時秒數。
+- `VLM_NUM_PREDICT`：VLM 結構化描述的最大輸出 Token 數。
+
+介面中的「VLM 視覺分析」頁籤會顯示格式化描述、模型名稱與安全化的失敗原因。VLM 描述屬於模型生成內容，精確文字、金額、日期與型號仍應以原生文字／OCR 為主；本 MVP 不會在最終回答階段重新傳送原始圖片，也不永久保存圖片或 FAISS 索引。
 
 若要使用 OCR，除 `requirements.txt` 之外，還需要依照本機 CPU/GPU 環境安裝 PaddlePaddle runtime。CPU 版可參考 PaddleOCR 官方安裝文件：
 

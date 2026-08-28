@@ -15,9 +15,13 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 
 from .config import Settings
-from .document_loader import DocumentBatch, pdf_processing_cache_settings
+from .document_loader import (
+    DocumentBatch,
+    DocumentExtractionStats,
+    pdf_processing_cache_settings,
+)
 
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2
 INDEX_FILENAME = "index.faiss"
 DOCUMENTS_FILENAME = "documents.json"
 MANIFEST_FILENAME = "manifest.json"
@@ -185,6 +189,21 @@ def load_evaluation_cache(
                 str(key): str(value)
                 for key, value in payload["parsed_text_by_source"].items()
             },
+            ocr_text_by_source={
+                str(key): str(value)
+                for key, value in payload.get("ocr_text_by_source", {}).items()
+            },
+            extraction_stats=DocumentExtractionStats(
+                **payload.get("extraction_stats", {})
+            ),
+            visual_text_by_source={
+                str(key): str(value)
+                for key, value in payload.get("visual_text_by_source", {}).items()
+            },
+            vlm_failures_by_source={
+                str(key): str(value)
+                for key, value in payload.get("vlm_failures_by_source", {}).items()
+            },
         )
         index = faiss.read_index(str(index_path))
     except (AttributeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
@@ -243,6 +262,20 @@ def save_evaluation_cache(
         "document_count": batch.document_count,
         "page_count": batch.page_count,
         "parsed_text_by_source": batch.parsed_text_by_source,
+        "ocr_text_by_source": batch.ocr_text_by_source,
+        "extraction_stats": _json_safe(
+            {
+                "native_page_count": batch.extraction_stats.native_page_count,
+                "ocr_page_count": batch.extraction_stats.ocr_page_count,
+                "image_page_count": batch.extraction_stats.image_page_count,
+                "ocr_confidences": batch.extraction_stats.ocr_confidences,
+                "vlm_page_count": batch.extraction_stats.vlm_page_count,
+                "vlm_failure_count": batch.extraction_stats.vlm_failure_count,
+                "visual_chunk_count": batch.extraction_stats.visual_chunk_count,
+            }
+        ),
+        "visual_text_by_source": batch.visual_text_by_source,
+        "vlm_failures_by_source": batch.vlm_failures_by_source,
         "chunks": [
             {
                 "page_content": chunk.page_content,

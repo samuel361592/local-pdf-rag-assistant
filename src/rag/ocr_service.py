@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .image_renderer import render_pdf_page_to_image
 
 OCR_ENGINE_NAME = "PaddleOCR"
 SUPPORTED_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
@@ -118,20 +119,23 @@ class OCRService:
             ) from exc
         return _normalize_ocr_result(raw_result)
 
-    def pdf_page_to_text(self, pdf_path: Path, page_index: int) -> OCRResult:
-        png_path: Path | None = None
+    def image_bytes_to_text(self, image_bytes: bytes, *, suffix: str = ".png") -> OCRResult:
+        image_path: Path | None = None
         try:
-            try:
-                import pymupdf
-            except ImportError as exc:
-                raise OCRError("需要 OCR PDF 時找不到 PyMuPDF。請先安裝 pymupdf。") from exc
-            with pymupdf.open(pdf_path) as pdf:
-                page = pdf.load_page(page_index)
-                pixmap = page.get_pixmap(dpi=self.settings.ocr_dpi, alpha=False)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as file:
-                    png_path = Path(file.name)
-                pixmap.save(png_path)
-            return self.image_file_to_text(png_path)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as file:
+                file.write(image_bytes)
+                image_path = Path(file.name)
+            return self.image_file_to_text(image_path)
+        finally:
+            if image_path is not None:
+                image_path.unlink(missing_ok=True)
+
+    def pdf_page_to_text(self, pdf_path: Path, page_index: int) -> OCRResult:
+        try:
+            image_bytes = render_pdf_page_to_image(
+                pdf_path, page_index, dpi=self.settings.ocr_dpi
+            )
+            return self.image_bytes_to_text(image_bytes)
         except OCRError:
             raise
         except Exception as exc:
@@ -139,9 +143,6 @@ class OCRService:
             raise OCRError(
                 f"OCR 辨識 PDF 第 {page_index + 1} 頁失敗：{detail}"
             ) from exc
-        finally:
-            if png_path is not None:
-                png_path.unlink(missing_ok=True)
 
     def _run_ocr(self, image_path: Path) -> Any:
         engine = self.engine

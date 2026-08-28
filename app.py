@@ -16,12 +16,15 @@ from langchain_core.documents import Document
 
 from src.rag.config import Settings, load_settings
 from src.rag.document_loader import (
+    CONTENT_TYPE_KEY,
     OCR_CONFIDENCE_KEY,
     OCR_EXTRACTION_METHOD,
     PAGE_NUMBER_KEY,
     PDFProcessingError,
     SOURCE_FILENAME_KEY,
     TEXT_EXTRACTION_METHOD_KEY,
+    VISUAL_CONTENT_TYPE,
+    VLM_EXTRACTION_METHOD,
     process_uploaded_pdfs,
 )
 from src.rag.rag_service import (
@@ -49,6 +52,12 @@ OCR_MODE_LABELS = {
     "disabled": "停用",
 }
 OCR_MODE_VALUES = {label: value for value, label in OCR_MODE_LABELS.items()}
+VLM_MODE_LABELS = {
+    "auto": "自動",
+    "all": "全部頁面",
+    "disabled": "停用",
+}
+VLM_MODE_VALUES = {label: value for value, label in VLM_MODE_LABELS.items()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,7 +373,11 @@ def render_chunk_preview(chunks: Sequence[Document]) -> None:
         filename = chunk.metadata.get(SOURCE_FILENAME_KEY, "未知檔案")
         page_number = chunk.metadata.get(PAGE_NUMBER_KEY, "未知")
         method = chunk.metadata.get(TEXT_EXTRACTION_METHOD_KEY, "unknown")
-        method_label = "OCR" if method == OCR_EXTRACTION_METHOD else "文字擷取"
+        content_type = chunk.metadata.get(CONTENT_TYPE_KEY)
+        if content_type == VISUAL_CONTENT_TYPE or method == VLM_EXTRACTION_METHOD:
+            method_label = "VLM 視覺分析"
+        else:
+            method_label = "OCR" if method == OCR_EXTRACTION_METHOD else "文字擷取"
         content = chunk.page_content.strip()
         short_filename = shorten_filename(filename)
         title = (
@@ -407,6 +420,39 @@ def render_ocr_preview(ocr_text_by_source: dict[str, str]) -> None:
     )
 
 
+def render_visual_preview(
+    visual_text_by_source: dict[str, str],
+    failures_by_source: dict[str, str],
+    model_name: str,
+) -> None:
+    st.subheader("VLM 視覺分析")
+    all_sources = sorted(set(visual_text_by_source) | set(failures_by_source))
+    if not all_sources:
+        st.info("目前沒有 VLM 視覺分析結果。")
+        return
+    if st.session_state.get("vlm_preview_source") not in all_sources:
+        st.session_state["vlm_preview_source"] = all_sources[0]
+    selected_source = st.selectbox(
+        "VLM 來源",
+        options=all_sources,
+        key="vlm_preview_source",
+    )
+    st.caption(f"模型：{model_name}｜模型生成分析，重要內容請人工確認。")
+    failure = failures_by_source.get(selected_source)
+    if failure:
+        st.warning(failure)
+        return
+    visual_text = visual_text_by_source.get(selected_source, "").strip()
+    if visual_text:
+        st.text_area(
+            "格式化視覺描述",
+            value=visual_text,
+            height=420,
+            disabled=True,
+            key=f"vlm_preview_text_{hashlib.sha1(selected_source.encode('utf-8')).hexdigest()[:12]}",
+        )
+
+
 def render_ocr_controls(settings: Settings) -> Settings:
     st.subheader("OCR")
     mode_label = OCR_MODE_LABELS.get(settings.ocr_mode, "自動")
@@ -427,6 +473,24 @@ def render_ocr_controls(settings: Settings) -> Settings:
     )
 
 
+def render_vlm_controls(settings: Settings) -> Settings:
+    st.subheader("VLM 視覺分析")
+    enabled = st.checkbox(
+        "啟用 VLM 視覺分析",
+        value=settings.vlm_enabled,
+        help="VLM 會在建庫時分析圖片或 PDF 頁面，因此會增加建庫時間。",
+    )
+    mode_label = VLM_MODE_LABELS.get(settings.vlm_mode, "自動")
+    mode = st.selectbox(
+        "VLM 模式",
+        options=("自動", "全部頁面", "停用"),
+        index=("自動", "全部頁面", "停用").index(mode_label),
+        help="自動模式分析圖片、需 OCR 的 PDF 頁及含內嵌圖片的 PDF 頁。",
+    )
+    st.caption(f"目前模型：{settings.vlm_model}")
+    return replace(settings, vlm_enabled=enabled, vlm_mode=VLM_MODE_VALUES[mode])
+
+
 def render_result(result: RagResult) -> None:
     st.subheader("回答")
     st.write(result.answer)
@@ -434,13 +498,19 @@ def render_result(result: RagResult) -> None:
     if result.sources:
         st.subheader("參考來源")
         for source in result.sources:
-            st.markdown(f"- [來源 {source.number}] {source.filename}，第 {source.page_number} 頁")
+            st.markdown(
+                f"- [來源 {source.number}｜{source.content_type_label}] "
+                f"{source.filename}，第 {source.page_number} 頁"
+            )
 
     with st.expander("查看實際檢索到的原始文字區塊"):
         if not result.chunks:
             st.caption("本次沒有檢索到文字區塊。")
         for source, chunk in zip(result.sources, result.chunks, strict=True):
-            st.markdown(f"**[來源 {source.number}] {source.filename}｜第 {source.page_number} 頁**")
+            st.markdown(
+                f"**[來源 {source.number}｜{source.content_type_label}] "
+                f"{source.filename}｜第 {source.page_number} 頁**"
+            )
             st.text(chunk.page_content.strip())
 
 
@@ -560,6 +630,7 @@ def main() -> None:
         st.error(f"設定錯誤：{exc}")
         st.stop()
     settings = render_ocr_controls(settings)
+    settings = render_vlm_controls(settings)
 
     uploaded_files = st.file_uploader(
         "上傳一份或多份 PDF 或圖片文件（PNG / JPG）",
@@ -593,15 +664,22 @@ def main() -> None:
                     "average_ocr_confidence": (
                         batch.extraction_stats.average_ocr_confidence
                     ),
+                    "vlm_pages": batch.extraction_stats.vlm_page_count,
+                    "vlm_failures": batch.extraction_stats.vlm_failure_count,
+                    "visual_chunks": batch.extraction_stats.visual_chunk_count,
+                    "vlm_model": settings.vlm_model,
                 }
                 st.session_state["knowledge_chunks"] = batch.chunks
                 st.session_state["ocr_text_by_source"] = batch.ocr_text_by_source
+                st.session_state["visual_text_by_source"] = batch.visual_text_by_source
+                st.session_state["vlm_failures_by_source"] = batch.vlm_failures_by_source
                 st.session_state["chunk_preview_page"] = 1
                 for preview_key in (
                     "chunk_preview_filename",
                     "chunk_preview_page_filter",
                     "chunk_preview_search",
                     "ocr_preview_source",
+                    "vlm_preview_source",
                 ):
                     st.session_state.pop(preview_key, None)
                 st.session_state.pop("rag_result", None)
@@ -617,18 +695,22 @@ def main() -> None:
 
     stats = st.session_state.get("knowledge_stats")
     if stats:
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4 = st.columns(4)
         col1.metric("文件數量", stats["documents"])
         col2.metric("頁數", stats["pages"])
         col3.metric("Chunk 數量", stats["chunks"])
         col4.metric("文字擷取頁", stats["native_pages"])
+        col5, col6, col7, col8 = st.columns(4)
         col5.metric("OCR 頁", stats["ocr_pages"])
+        col6.metric("VLM 分析頁", stats.get("vlm_pages", 0))
+        col7.metric("VLM 失敗頁", stats.get("vlm_failures", 0))
+        col8.metric("Visual Chunks", stats.get("visual_chunks", 0))
         if stats.get("average_ocr_confidence") is not None:
             st.caption(f"OCR 平均信心分數：{stats['average_ocr_confidence']:.2%}")
 
     st.divider()
-    question_tab, chunks_tab, ocr_tab = st.tabs(
-        ["文件問答", "Chunk 預覽", "OCR 預覽"]
+    question_tab, chunks_tab, ocr_tab, vlm_tab = st.tabs(
+        ["文件問答", "Chunk 預覽", "OCR 預覽", "VLM 視覺分析"]
     )
 
     with question_tab:
@@ -658,6 +740,17 @@ def main() -> None:
             render_ocr_preview(st.session_state.get("ocr_text_by_source", {}))
 
         ocr_preview_fragment()
+
+    with vlm_tab:
+        @st.fragment
+        def vlm_preview_fragment() -> None:
+            render_visual_preview(
+                st.session_state.get("visual_text_by_source", {}),
+                st.session_state.get("vlm_failures_by_source", {}),
+                str(st.session_state.get("knowledge_stats", {}).get("vlm_model", settings.vlm_model)),
+            )
+
+        vlm_preview_fragment()
 
 
 if __name__ == "__main__":

@@ -30,6 +30,12 @@ class Settings:
     ocr_dpi: int = 300
     ocr_enable_images: bool = True
     ocr_enable_mkldnn: bool = False
+    vlm_enabled: bool = False
+    vlm_model: str = "qwen3-vl:4b"
+    vlm_mode: str = "auto"
+    vlm_max_image_edge: int = 1600
+    vlm_timeout_seconds: int = 120
+    vlm_num_predict: int = 800
 
     def __post_init__(self) -> None:
         if self.chunk_size <= 0:
@@ -52,6 +58,16 @@ class Settings:
             raise ValueError("OCR_MIN_TEXT_CHARS 不可小於 0。")
         if self.ocr_dpi <= 0:
             raise ValueError("OCR_DPI 必須大於 0。")
+        if self.vlm_mode not in {"auto", "all", "disabled"}:
+            raise ValueError("VLM_MODE 必須是 auto、all 或 disabled。")
+        if self.vlm_max_image_edge <= 0:
+            raise ValueError("VLM_MAX_IMAGE_EDGE 必須大於 0。")
+        if self.vlm_timeout_seconds <= 0:
+            raise ValueError("VLM_TIMEOUT_SECONDS 必須大於 0。")
+        if self.vlm_num_predict <= 0:
+            raise ValueError("VLM_NUM_PREDICT 必須大於 0。")
+        if self.vlm_enabled and not self.vlm_model.strip():
+            raise ValueError("啟用 VLM 時，VLM_MODEL 不可為空白。")
 
 
 def _read_int(name: str, default: int) -> int:
@@ -114,5 +130,17 @@ def load_settings(
         ),
         ocr_enable_mkldnn=_read_bool(
             "OCR_ENABLE_MKLDNN", defaults.ocr_enable_mkldnn
+        ),
+        vlm_enabled=_read_bool("VLM_ENABLED", defaults.vlm_enabled),
+        vlm_model=os.getenv("VLM_MODEL", defaults.vlm_model),
+        vlm_mode=os.getenv("VLM_MODE", defaults.vlm_mode).strip().casefold(),
+        vlm_max_image_edge=_read_int(
+            "VLM_MAX_IMAGE_EDGE", defaults.vlm_max_image_edge
+        ),
+        vlm_timeout_seconds=_read_int(
+            "VLM_TIMEOUT_SECONDS", defaults.vlm_timeout_seconds
+        ),
+        vlm_num_predict=_read_int(
+            "VLM_NUM_PREDICT", defaults.vlm_num_predict
         ),
     )
